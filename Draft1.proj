@@ -50,28 +50,28 @@ set.seed(2026)
 # 2. DATA SETUP
 ############################################################
 
-# Assume dataframe is called:
-# dat
+library(readxl)
 
-# Required variables:
-# Y      = executive function outcome
-# Z      = treatment indicator (1=C-LIFE, 0=SEPA)
-# Covariates = 32 baseline covariates
+# Box file (make sure this is the correct file ID)
+url <- "https://duke.app.box.com/file/2053650404707?download=1"
 
-# Example:
-# names(dat)
+# Download to a temporary file
+temp <- tempfile(fileext = ".xlsx")
+download.file(url, temp, mode = "wb")
 
-# Outcome
-outcome_var <- "Y"
+# Read Excel into R
+data1 <- read_excel(temp)
 
-# Treatment
-treat_var <- "Z"
+# Define variables
+outcome_var <- "Y"   # executive function outcome
+treat_var <- "Z"     # treatment indicator (1 = C-LIFE, 0 = SEPA)
 
-# Covariates
-covariates <- setdiff(
-  names(dat),
-  c(outcome_var, treat_var)
-)
+# Covariates = all other variables
+covariates <- setdiff(names(data1), c(outcome_var, treat_var))
+
+# Quick checks
+str(data1)
+head(data1)
 
 ############################################################
 # 3. MULTIPLE IMPUTATION USING MICE
