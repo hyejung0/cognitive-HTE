@@ -80,7 +80,7 @@ head(data1)
 # Only continuous variables contain missingness
 # Predictive Mean Matching (PMM)
 
-ini <- mice(dat, maxit = 0)
+ini <- mice(data1, maxit = 0)
 
 meth <- ini$method
 
@@ -96,7 +96,7 @@ diag(pred) <- 0
 
 # Generate 5 imputed datasets
 imp <- mice(
-  dat,
+  data1,
   m = 5,
   method = meth,
   predictorMatrix = pred,
@@ -489,4 +489,5 @@ saveRDS(
 ############################################################
 # END OF ANALYSIS
 ############################################################
+
 
