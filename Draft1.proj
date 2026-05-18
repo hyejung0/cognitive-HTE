@@ -1,0 +1,492 @@
+############################################################
+# Bayesian Causal Forest (BCF) Analysis Pipeline
+# - Multiple Imputation using MICE
+# - BCF estimation across imputed datasets
+# - Posterior pooling across imputations
+# - Prespecified subgroup analyses
+# - Data-driven subgroup discovery using CART
+#
+# Author: Emma Zhang
+# Date: 2026
+############################################################
+
+#############################
+# 1. Load Packages
+#############################
+
+required_packages <- c(
+  "mice",
+  "bcf",
+  "dplyr",
+  "purrr",
+  "ggplot2",
+  "rpart",
+  "rpart.plot",
+  "posterior",
+  "tidyr"
+)
+
+installed <- rownames(installed.packages())
+
+for(p in required_packages){
+  if(!(p %in% installed)){
+    install.packages(p)
+  }
+}
+
+library(mice)
+library(bcf)
+library(dplyr)
+library(purrr)
+library(ggplot2)
+library(rpart)
+library(rpart.plot)
+library(posterior)
+library(tidyr)
+
+set.seed(2026)
+
+############################################################
+# 2. DATA SETUP
+############################################################
+
+# Assume dataframe is called:
+# dat
+
+# Required variables:
+# Y      = executive function outcome
+# Z      = treatment indicator (1=C-LIFE, 0=SEPA)
+# Covariates = 32 baseline covariates
+
+# Example:
+# names(dat)
+
+# Outcome
+outcome_var <- "Y"
+
+# Treatment
+treat_var <- "Z"
+
+# Covariates
+covariates <- setdiff(
+  names(dat),
+  c(outcome_var, treat_var)
+)
+
+############################################################
+# 3. MULTIPLE IMPUTATION USING MICE
+############################################################
+
+# Only continuous variables contain missingness
+# Predictive Mean Matching (PMM)
+
+ini <- mice(dat, maxit = 0)
+
+meth <- ini$method
+
+# Use PMM for all variables with missing values
+meth[meth != ""] <- "pmm"
+
+# Predictor matrix:
+# use ALL variables including outcome and treatment
+pred <- ini$predictorMatrix
+
+# Do not use variable to predict itself
+diag(pred) <- 0
+
+# Generate 5 imputed datasets
+imp <- mice(
+  dat,
+  m = 5,
+  method = meth,
+  predictorMatrix = pred,
+  maxit = 20,
+  seed = 2026
+)
+
+############################################################
+# 4. EXTRACT IMPUTED DATASETS
+############################################################
+
+imputed_datasets <- lapply(
+  1:5,
+  function(i) complete(imp, i)
+)
+
+############################################################
+# 5. BCF SETTINGS
+############################################################
+
+# ---- PRIMARY ANALYSIS PRIORS ----
+# tau prior = default skeptical prior
+
+primary_params <- list(
+  
+  # mu parameters
+  ntree_control = 200,
+  base_control  = 0.95,
+  power_control = 2,
+  
+  # tau parameters
+  ntree_moderate = 50,
+  base_moderate  = 0.25,
+  power_moderate = 3
+)
+
+# ---- SENSITIVITY ANALYSIS PRIORS ----
+# tau prior same as mu
+
+sensitivity_params <- list(
+  
+  ntree_control = 200,
+  base_control  = 0.95,
+  power_control = 2,
+  
+  ntree_moderate = 200,
+  base_moderate  = 0.95,
+  power_moderate = 2
+)
+
+############################################################
+# 6. FUNCTION TO FIT BCF
+############################################################
+
+fit_bcf_model <- function(
+    data,
+    params,
+    nburn = 2000,
+    nsim = 5000
+){
+  
+  y <- data[[outcome_var]]
+  z <- data[[treat_var]]
+  
+  x <- data %>%
+    select(all_of(covariates)) %>%
+    as.matrix()
+  
+  # Constant propensity score due to randomization
+  pihat <- rep(2/3, nrow(data))
+  
+  # Fit BCF
+  fit <- bcf(
+    y = y,
+    z = z,
+    x_control = x,
+    x_moderate = x,
+    pihat = pihat,
+    
+    nburn = nburn,
+    nsim = nsim,
+    
+    # mu priors
+    ntree_control = params$ntree_control,
+    base_control = params$base_control,
+    power_control = params$power_control,
+    
+    # tau priors
+    ntree_moderate = params$ntree_moderate,
+    base_moderate = params$base_moderate,
+    power_moderate = params$power_moderate
+  )
+  
+  return(fit)
+}
+
+############################################################
+# 7. FIT BCF ACROSS IMPUTED DATASETS
+############################################################
+
+# PRIMARY ANALYSIS
+
+bcf_primary_fits <- lapply(
+  imputed_datasets,
+  fit_bcf_model,
+  params = primary_params
+)
+
+# SENSITIVITY ANALYSIS
+
+bcf_sensitivity_fits <- lapply(
+  imputed_datasets,
+  fit_bcf_model,
+  params = sensitivity_params
+)
+
+############################################################
+# 8. EXTRACT POSTERIOR DRAWS
+############################################################
+
+# tau = treatment effect draws
+# dimensions:
+# iterations x subjects
+
+extract_tau_draws <- function(fit){
+  fit$tau
+}
+
+primary_tau_draws <- lapply(
+  bcf_primary_fits,
+  extract_tau_draws
+)
+
+############################################################
+# 9. POOL POSTERIOR DRAWS ACROSS IMPUTATIONS
+############################################################
+
+# Zhou & Reiter (2010):
+# Mix posterior draws from all imputations
+
+pooled_tau_draws <- do.call(
+  rbind,
+  primary_tau_draws
+)
+
+############################################################
+# 10. OVERALL ATE
+############################################################
+
+# ATE per posterior draw
+ate_draws <- apply(
+  pooled_tau_draws,
+  1,
+  mean
+)
+
+overall_ate <- mean(ate_draws)
+
+overall_ci <- quantile(
+  ate_draws,
+  probs = c(0.025, 0.975)
+)
+
+prob_gt_zero <- mean(ate_draws > 0)
+
+cat("\n")
+cat("Overall ATE:\n")
+cat(overall_ate, "\n")
+
+cat("\n95% Credible Interval:\n")
+print(overall_ci)
+
+cat("\nPr(ATE > 0):\n")
+print(prob_gt_zero)
+
+############################################################
+# 11. SUBJECT-LEVEL CATE ESTIMATES
+############################################################
+
+# Posterior mean CATE for each subject
+cate_hat <- colMeans(pooled_tau_draws)
+
+############################################################
+# 12. PRESPECIFIED SUBGROUP ANALYSES
+############################################################
+
+# Example subgroup variables:
+# sex : "Male"/"Female"
+# age
+
+analysis_data <- imputed_datasets[[1]]
+
+############################################################
+# Male vs Female
+############################################################
+
+male_idx <- which(analysis_data$sex == "Male")
+female_idx <- which(analysis_data$sex == "Female")
+
+male_draws <- apply(
+  pooled_tau_draws[, male_idx],
+  1,
+  mean
+)
+
+female_draws <- apply(
+  pooled_tau_draws[, female_idx],
+  1,
+  mean
+)
+
+diff_draws_sex <- male_draws - female_draws
+
+summary_sex <- tibble(
+  subgroup1 = "Male",
+  subgroup2 = "Female",
+  
+  posterior_mean = mean(diff_draws_sex),
+  
+  lower_95 = quantile(diff_draws_sex, 0.025),
+  upper_95 = quantile(diff_draws_sex, 0.975),
+  
+  prob_gt_zero = mean(diff_draws_sex > 0)
+)
+
+summary_sex
+
+############################################################
+# Age <60 vs >=60
+############################################################
+
+young_idx <- which(analysis_data$age < 60)
+old_idx <- which(analysis_data$age >= 60)
+
+young_draws <- apply(
+  pooled_tau_draws[, young_idx],
+  1,
+  mean
+)
+
+old_draws <- apply(
+  pooled_tau_draws[, old_idx],
+  1,
+  mean
+)
+
+diff_draws_age <- young_draws - old_draws
+
+summary_age <- tibble(
+  subgroup1 = "<60",
+  subgroup2 = ">=60",
+  
+  posterior_mean = mean(diff_draws_age),
+  
+  lower_95 = quantile(diff_draws_age, 0.025),
+  upper_95 = quantile(diff_draws_age, 0.975),
+  
+  prob_gt_zero = mean(diff_draws_age > 0)
+)
+
+summary_age
+
+############################################################
+# 13. POSTERIOR DENSITY PLOTS
+############################################################
+
+plot_df <- tibble(
+  male = male_draws,
+  female = female_draws,
+  difference = diff_draws_sex
+)
+
+plot_df_long <- plot_df %>%
+  pivot_longer(
+    everything(),
+    names_to = "group",
+    values_to = "value"
+  )
+
+ggplot(plot_df_long, aes(x = value, fill = group)) +
+  geom_density(alpha = 0.4) +
+  theme_bw() +
+  labs(
+    title = "Posterior Treatment Effect Distributions",
+    x = "Treatment Effect",
+    y = "Density"
+  )
+
+############################################################
+# 14. DATA-DRIVEN SUBGROUP DISCOVERY
+############################################################
+
+# Use posterior mean CATE estimates
+cart_data <- analysis_data
+
+cart_data$cate_hat <- cate_hat
+
+# Formula
+cart_formula <- as.formula(
+  paste(
+    "cate_hat ~",
+    paste(covariates, collapse = " + ")
+  )
+)
+
+# Fit CART
+cart_fit <- rpart(
+  formula = cart_formula,
+  data = cart_data,
+  method = "anova",
+  
+  control = rpart.control(
+    cp = 0.01,
+    minbucket = 20,
+    maxdepth = 3
+  )
+)
+
+############################################################
+# 15. PLOT CART
+############################################################
+
+rpart.plot(
+  cart_fit,
+  type = 3,
+  extra = 101,
+  fallen.leaves = TRUE
+)
+
+############################################################
+# 16. IDENTIFY TERMINAL NODES
+############################################################
+
+terminal_nodes <- cart_fit$where
+
+cart_data$subgroup <- terminal_nodes
+
+table(cart_data$subgroup)
+
+############################################################
+# 17. SUBGROUP ATEs FROM BCF POSTERIOR
+############################################################
+
+subgroup_results <- lapply(
+  unique(terminal_nodes),
+  function(g){
+    
+    idx <- which(terminal_nodes == g)
+    
+    subgroup_draws <- apply(
+      pooled_tau_draws[, idx],
+      1,
+      mean
+    )
+    
+    tibble(
+      subgroup = g,
+      posterior_mean = mean(subgroup_draws),
+      lower_95 = quantile(subgroup_draws, 0.025),
+      upper_95 = quantile(subgroup_draws, 0.975),
+      prob_gt_zero = mean(subgroup_draws > 0)
+    )
+  }
+)
+
+subgroup_results <- bind_rows(subgroup_results)
+
+subgroup_results
+
+############################################################
+# 18. SAVE RESULTS
+############################################################
+
+write.csv(
+  subgroup_results,
+  "subgroup_results.csv",
+  row.names = FALSE
+)
+
+saveRDS(
+  bcf_primary_fits,
+  "bcf_primary_fits.rds"
+)
+
+saveRDS(
+  pooled_tau_draws,
+  "pooled_tau_draws.rds"
+)
+
+############################################################
+# END OF ANALYSIS
+############################################################
+
