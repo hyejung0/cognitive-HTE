@@ -2,15 +2,28 @@
 # Bayesian Causal Forest (BCF) Pipeline 
 ############################################################
 
+
+install.packages("Rcpp", type = "source")
+
+install.packages("RcppParallel", type = "source")
+
+install.packages("bcf", type = "source")
+
 #############################
 # 1. Packages
 #############################
 
-pkgs <- c("mice","bcf","dplyr","purrr","ggplot2",
-          "rpart","rpart.plot","posterior","tidyr","readxl")
+pkgs <- c(
+  "mice", "bcf", "dplyr", "purrr", "ggplot2",
+  "rpart", "rpart.plot", "posterior",
+  "tidyr", "readxl"
+)
 
 to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
-if(length(to_install)) install.packages(to_install)
+
+if(length(to_install)) {
+  install.packages(to_install)
+}
 
 invisible(lapply(pkgs, library, character.only = TRUE))
 
@@ -20,13 +33,29 @@ set.seed(2026)
 # 2. Load Data
 #############################
 
-url <- "https://duke.app.box.com/file/2053650404707?download=1"
-url_add <- "https://duke.app.box.com/file/2171500674806?download=1"
+df_main <- read_excel("Nikki Smith R01 Subset (1).xls")
 
-tmp_file <- tempfile(fileext = ".xlsx")
-download.file(url, tmp_file, mode = "wb")
+df_add <- read_excel(
+  "PSmith R01 additional data (1).xlsx"
+)
 
-df <- read_excel(tmp_file)
+#############################
+# 3. Merge Data
+#############################
+
+# Check common columns
+common_cols <- intersect(names(df_main), names(df_add))
+
+print(common_cols)
+
+# Replace with your actual ID variable if needed
+id_var <- common_cols[1]
+
+df <- left_join(df_main, df_add, by = id_var)
+
+#############################
+# 4. Define Variables
+#############################
 
 outcome <- "Y"
 treat   <- "Z"
@@ -34,7 +63,17 @@ treat   <- "Z"
 covars <- setdiff(names(df), c(outcome, treat))
 
 #############################
-# 3. Multiple Imputation (MICE)
+# 5. Inspect Data
+#############################
+
+glimpse(df)
+
+
+#####################################################################
+
+
+#############################
+# 6. Multiple Imputation (MICE)
 #############################
 
 ini <- mice(df, maxit = 0)
@@ -56,8 +95,20 @@ imp <- mice(
 
 imp_list <- lapply(seq_len(imp$m), complete, data = imp)
 
+# Check imputed structure
+dplyr::glimpse(imp_list[[1]])
+
+# Ensure BCF-safe formats
+imp_list <- lapply(imp_list, function(dat) {
+  dat <- dplyr::mutate(dat, dplyr::across(where(is.character), as.factor))
+  dat <- dplyr::mutate(dat, dplyr::across(where(is.factor), as.integer))
+  dat
+})
+
+dplyr::glimpse(imp_list[[1]])
+
 #############################
-# 4. BCF parameter sets
+# 7. BCF parameter sets
 #############################
 
 bcf_primary <- list(
@@ -79,7 +130,7 @@ bcf_sensitivity <- list(
 )
 
 #############################
-# 5. BCF fit function
+# 8. BCF fit function
 #############################
 
 fit_bcf <- function(data, pars,
@@ -88,9 +139,9 @@ fit_bcf <- function(data, pars,
   
   y <- data[[outcome]]
   z <- data[[treat]]
-  X <- as.matrix(dplyr::select(data, all_of(covars)))
+  X <- as.matrix(dplyr::select(data, dplyr::all_of(covars)))
   
-  pihat <- rep(mean(z), nrow(data))  # cleaner than hard-coded 2/3
+  pihat <- rep(mean(z, na.rm = TRUE), nrow(data))
   
   bcf(
     y = y,
@@ -109,10 +160,6 @@ fit_bcf <- function(data, pars,
   )
 }
 
-#############################
-# 6. Fit models across imputations
-#############################
-
 fit_all_imputations <- function(imp_list, pars) {
   lapply(imp_list, fit_bcf,
          pars = pars,
@@ -121,21 +168,32 @@ fit_all_imputations <- function(imp_list, pars) {
          covars = covars)
 }
 
+#############################
+# 9. Fit BCF models
+#############################
+
 bcf_primary_models <- fit_all_imputations(imp_list, bcf_primary)
+
+# Check model object
+str(bcf_primary_models[[1]])
+
 bcf_sensitivity_models <- fit_all_imputations(imp_list, bcf_sensitivity)
 
 #############################
-# 7. Extract posterior tau
+# 10. Extract posterior tau
 #############################
 
 extract_tau <- function(fit) fit$tau
 
 tau_list <- lapply(bcf_primary_models, extract_tau)
-
 pooled_tau <- do.call(rbind, tau_list)
 
+# Check tau matrix
+dim(pooled_tau)
+dplyr::glimpse(as.data.frame(pooled_tau[, 1:5]))
+
 #############################
-# 8. Overall treatment effect
+# 11. Overall treatment effect (ATE)
 #############################
 
 ate_draws <- rowMeans(pooled_tau)
@@ -149,23 +207,30 @@ print(ate_ci)
 cat("\nP(ATE > 0):", p_gt_zero, "\n")
 
 #############################
-# 9. Subject-level CATE
+# 12. Subject-level CATE
 #############################
 
 cate <- colMeans(pooled_tau)
 
+# Check CATE structure
+dplyr::glimpse(data.frame(cate = cate))
+
 #############################
-# 10. Subgroup helper
+# 13. Subgroup function
 #############################
 
 subgroup_effect <- function(idx, label1, label2) {
   
-  g1 <- apply(pooled_tau[, idx[[1]]], 1, mean)
-  g2 <- apply(pooled_tau[, idx[[2]]], 1, mean)
+  if(length(idx[[1]]) == 0 || length(idx[[2]]) == 0) {
+    stop("Empty subgroup detected — check coding.")
+  }
+  
+  g1 <- apply(pooled_tau[, idx[[1]], drop = FALSE], 1, mean)
+  g2 <- apply(pooled_tau[, idx[[2]], drop = FALSE], 1, mean)
   
   diff <- g1 - g2
   
-  tibble(
+  tibble::tibble(
     group1 = label1,
     group2 = label2,
     mean = mean(diff),
@@ -176,12 +241,14 @@ subgroup_effect <- function(idx, label1, label2) {
 }
 
 #############################
-# 11. Subgroup analyses
+# 14. Subgroup analyses
 #############################
 
 analysis_df <- imp_list[[1]]
 
-# Sex
+dplyr::glimpse(analysis_df)
+
+# Sex subgroup
 sex_idx <- list(
   male = which(analysis_df$sex == "Male"),
   female = which(analysis_df$sex == "Female")
@@ -189,7 +256,7 @@ sex_idx <- list(
 
 sex_res <- subgroup_effect(sex_idx, "Male", "Female")
 
-# Age
+# Age subgroup
 age_idx <- list(
   young = which(analysis_df$age < 60),
   old   = which(analysis_df$age >= 60)
@@ -198,66 +265,79 @@ age_idx <- list(
 age_res <- subgroup_effect(age_idx, "<60", ">=60")
 
 #############################
-# 12. Density plot
+# 15. Density plot
 #############################
 
-plot_df <- tibble(
-  male = apply(pooled_tau[, sex_idx$male], 1, mean),
-  female = apply(pooled_tau[, sex_idx$female], 1, mean)
-) %>%
-  pivot_longer(everything(), names_to = "group", values_to = "value")
+plot_df <- tibble::tibble(
+  male = apply(pooled_tau[, sex_idx$male, drop = FALSE], 1, mean),
+  female = apply(pooled_tau[, sex_idx$female, drop = FALSE], 1, mean)
+)
 
-ggplot(plot_df, aes(value, fill = group)) +
-  geom_density(alpha = 0.4) +
-  theme_bw()
+dplyr::glimpse(plot_df)
+
+plot_df <- tidyr::pivot_longer(
+  plot_df,
+  cols = everything(),
+  names_to = "group",
+  values_to = "value"
+)
+
+ggplot2::ggplot(plot_df, ggplot2::aes(value, fill = group)) +
+  ggplot2::geom_density(alpha = 0.4) +
+  ggplot2::theme_bw()
 
 #############################
-# 13. CART for subgroup discovery
+# 16. CART for subgroup discovery
 #############################
 
 cart_df <- analysis_df
 cart_df$cate <- cate
 
+dplyr::glimpse(cart_df)
+
 form <- as.formula(
   paste("cate ~", paste(covars, collapse = " + "))
 )
 
-cart_fit <- rpart(
+cart_fit <- rpart::rpart(
   form,
   data = cart_df,
   method = "anova",
-  control = rpart.control(cp = 0.01,
-                          minbucket = 20,
-                          maxdepth = 3)
+  control = rpart.control(
+    cp = 0.01,
+    minbucket = 20,
+    maxdepth = 3
+  )
 )
 
-rpart.plot(cart_fit, type = 3, extra = 101)
+rpart.plot::rpart.plot(cart_fit, type = 3, extra = 101)
 
 #############################
-# 14. Terminal node subgroup effects
+# 17. Terminal node effects
 #############################
 
 nodes <- cart_fit$where
-
 cart_df$node <- nodes
+
+dplyr::glimpse(cart_df)
 
 node_results <- lapply(unique(nodes), function(n) {
   
   idx <- which(nodes == n)
   
-  draw <- apply(pooled_tau[, idx], 1, mean)
+  draw <- apply(pooled_tau[, idx, drop = FALSE], 1, mean)
   
-  tibble(
+  tibble::tibble(
     node = n,
     mean = mean(draw),
     lo = quantile(draw, 0.025),
     hi = quantile(draw, 0.975),
     p_gt_0 = mean(draw > 0)
   )
-}) %>% bind_rows()
+}) %>% dplyr::bind_rows()
 
 #############################
-# 15. Save
+# 18. Save results
 #############################
 
 write.csv(node_results, "subgroup_results.csv", row.names = FALSE)
