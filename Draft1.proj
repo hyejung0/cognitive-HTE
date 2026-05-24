@@ -95,17 +95,12 @@ imp <- mice(
 
 imp_list <- lapply(seq_len(imp$m), complete, data = imp)
 
-# Check imputed structure
-dplyr::glimpse(imp_list[[1]])
-
 # Ensure BCF-safe formats
 imp_list <- lapply(imp_list, function(dat) {
   dat <- dplyr::mutate(dat, dplyr::across(where(is.character), as.factor))
   dat <- dplyr::mutate(dat, dplyr::across(where(is.factor), as.integer))
   dat
 })
-
-dplyr::glimpse(imp_list[[1]])
 
 #############################
 # 7. BCF parameter sets
@@ -172,38 +167,230 @@ fit_all_imputations <- function(imp_list, pars) {
 # 9. Fit BCF models
 #############################
 
-bcf_primary_models <- fit_all_imputations(imp_list, bcf_primary)
+# Primary outcome:
+# Executive function change score
+# (post-treatment minus baseline)
 
-# Check model object
-str(bcf_primary_models[[1]])
-
-bcf_sensitivity_models <- fit_all_imputations(imp_list, bcf_sensitivity)
+bcf_primary <- function(data) {
+  
+  #############################
+  # Outcome
+  #############################
+  
+  y <- as.numeric(
+    data$pjexect2r - data$pjexect1r
+  )
+  
+  #############################
+  # Treatment assignment
+  #############################
+  
+  # SEPA   = 0
+  # C-LIFE = 1
+  
+  z <- ifelse(
+    data$group == "C-LIFE",
+    1,
+    0
+  )
+  
+  z <- as.numeric(z)
+  
+  #############################
+  # Covariates
+  #############################
+  
+  X <- data[, c(
+    "Age",
+    "male.x"
+  )]
+  
+  #############################
+  # Clean covariates
+  #############################
+  
+  X <- data.frame(
+    lapply(X, function(x) {
+      
+      if (is.factor(x) || is.logical(x)) {
+        
+        as.numeric(as.factor(x))
+        
+      } else {
+        
+        as.numeric(x)
+      }
+    })
+  )
+  
+  #############################
+  # Remove incomplete rows
+  #############################
+  
+  keep <- complete.cases(y, z, X)
+  
+  y <- y[keep]
+  z <- z[keep]
+  X <- X[keep, ]
+  
+  #############################
+  # Convert to matrix
+  #############################
+  
+  X <- as.matrix(X)
+  
+  #############################
+  # Diagnostics
+  #############################
+  
+  cat("\nModel diagnostics:\n")
+  cat("length(y):", length(y), "\n")
+  cat("length(z):", length(z), "\n")
+  cat("nrow(X):", nrow(X), "\n")
+  
+  #############################
+  # Propensity scores
+  #############################
+  
+  # Since this is a randomized trial,
+  # use empirical treatment probability
+  
+  pihat <- rep(
+    mean(z),
+    length(z)
+  )
+  
+  #############################
+  # Fit Bayesian Causal Forest
+  #############################
+  
+  fit <- bcf(
+    y = y,
+    z = z,
+    x_control = X,
+    x_moderate = X,
+    pihat = pihat
+  )
+  
+  return(fit)
+}
 
 #############################
-# 10. Extract posterior tau
+# Run BCF across imputations
 #############################
 
-extract_tau <- function(fit) fit$tau
+bcf_primary_models <- lapply(
+  imp_list,
+  function(dat) {
+    
+    tryCatch({
+      
+      fit <- bcf_primary(dat)
+      
+      cat("Model fit successful\n")
+      
+      return(fit)
+      
+    }, error = function(e) {
+      
+      cat("Model failed:\n")
+      print(e)
+      
+      return(NULL)
+    })
+  }
+)
 
+#############################
+# Remove failed models
+#############################
+
+bcf_primary_models <- Filter(
+  Negate(is.null),
+  bcf_primary_models
+)
+
+#############################
+# Check number of successful fits
+#############################
+
+cat(
+  "\nSuccessful models:",
+  length(bcf_primary_models),
+  "\n"
+)
+
+#############################
+# 10. Extract posterior tau draws
+#############################
+
+extract_tau <- function(fit) {
+  
+  # Check model exists
+  if (is.null(fit)) {
+    return(NULL)
+  }
+  
+  # Check tau exists
+  if (is.null(fit$tau)) {
+    stop("tau not found in BCF model object")
+  }
+  
+  tau <- fit$tau
+  
+  # Ensure matrix format
+  tau <- as.matrix(tau)
+  
+  return(tau)
+}
+
+# Extract tau from all successful models
 tau_list <- lapply(bcf_primary_models, extract_tau)
+
+# Remove failed/null fits
+tau_list <- tau_list[!sapply(tau_list, is.null)]
+
+# Check dimensions
+lapply(tau_list, dim)
+
+# Combine posterior draws across imputations
 pooled_tau <- do.call(rbind, tau_list)
 
-# Check tau matrix
+# Inspect
 dim(pooled_tau)
-dplyr::glimpse(as.data.frame(pooled_tau[, 1:5]))
+
+dplyr::glimpse(
+  as.data.frame(
+    pooled_tau[, 1:min(5, ncol(pooled_tau))]
+  )
+)
 
 #############################
 # 11. Overall treatment effect (ATE)
 #############################
 
-ate_draws <- rowMeans(pooled_tau)
+# Average treatment effect for each posterior draw
+ate_draws <- rowMeans(pooled_tau, na.rm = TRUE)
 
-overall_ate <- mean(ate_draws)
-ate_ci <- quantile(ate_draws, c(0.025, 0.975))
-p_gt_zero <- mean(ate_draws > 0)
+# Posterior mean ATE
+overall_ate <- mean(ate_draws, na.rm = TRUE)
 
+# 95% credible interval
+ate_ci <- quantile(
+  ate_draws,
+  probs = c(0.025, 0.975),
+  na.rm = TRUE
+)
+
+# Posterior probability ATE > 0
+p_gt_zero <- mean(ate_draws > 0, na.rm = TRUE)
+
+# Results
 cat("\nATE:", overall_ate, "\n")
+
+cat("\n95% Credible Interval:\n")
 print(ate_ci)
+
 cat("\nP(ATE > 0):", p_gt_zero, "\n")
 
 #############################
