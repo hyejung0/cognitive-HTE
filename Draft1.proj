@@ -39,6 +39,750 @@ df_add <- read_excel(
   "PSmith R01 additional data (1).xlsx"
 )
 
+
+
+#############################
+# 3. Merge Data
+#############################
+
+# Check common columns
+common_cols <- intersect(
+  names(df_main),
+  names(df_add)
+)
+
+print(common_cols)
+
+# Merge using first common column
+# (replace if another ID is correct)
+
+id_var <- common_cols[1]
+
+df <- left_join(
+  df_main,
+  df_add,
+  by = id_var
+)
+
+#############################
+# 4. Data Cleaning
+#############################
+
+# Remove ID variable
+
+df <- df %>%
+  select(-SUBID)
+
+#############################
+# Convert character numeric
+# variables with "." to NA
+#############################
+
+char_numeric_vars <- c(
+  "homadiff",
+  "bhitoidiff",
+  "bhio2diff",
+  "vmro2diff",
+  "vmrtoidiff",
+  "nirscogdiff",
+  "nirso2diff",
+  "nirstoidiff",
+  "veldiff",
+  "flowdiff"
+)
+
+df <- df %>%
+  mutate(
+    across(
+      all_of(char_numeric_vars),
+      ~ na_if(., ".")
+    )
+  )
+
+df <- df %>%
+  mutate(
+    across(
+      all_of(char_numeric_vars),
+      as.numeric
+    )
+  )
+
+#############################
+# Remove duplicate sex vars
+#############################
+
+df <- df %>%
+  select(
+    -male.y,
+    -Gender
+  )
+
+#############################
+# 5. Define Variables
+#############################
+
+# Treatment:
+# SEPA = 0
+# C-LIFE = 1
+
+df$z <- ifelse(
+  df$group == "C-LIFE",
+  1,
+  0
+)
+
+#############################
+# Outcome variables
+#############################
+
+df$exec_change <- (
+  df$pjexect2r -
+    df$pjexect1r
+)
+
+df$mem_change <- (
+  df$memt2r -
+    df$memt1r
+)
+
+df$speed_change <- (
+  df$speedt2r -
+    df$speedt1r
+)
+
+#############################
+# Covariates
+#############################
+
+covars <- c(
+  
+  # demographics
+  "Age",
+  "male.x",
+  "minority",
+  "eduyrs",
+  
+  # baseline cognition
+  "speedt1r",
+  "memt1r",
+  "pjexect1r",
+  
+  # blood pressure
+  "clinicdbpt1",
+  "clinicsbpt1",
+  "MeanSys24hrT1",
+  "MeanDia24hrT1",
+  
+  # fitness
+  "avgstepst1",
+  "pkvo2t1",
+  
+  # metabolic
+  "Glucose",
+  "Insulin",
+  "HbA1C",
+  
+  # lipids
+  "totChol",
+  "Trigly",
+  "HDL",
+  "LDL",
+  
+  # vascular
+  "fmdt1",
+  "fart1",
+  
+  # adiposity
+  "wthrt1",
+  
+  # metabolic syndrome
+  "metsynst1"
+)
+
+#############################
+# 6. Inspect Data
+#############################
+
+glimpse(df)
+
+#############################
+# 7. Multiple Imputation
+#############################
+
+ini <- mice(
+  df,
+  maxit = 0
+)
+
+meth <- ini$method
+
+#############################
+# Use predictive mean matching
+# for continuous variables
+#############################
+
+meth[meth != ""] <- "pmm"
+
+#############################
+# Predictor matrix
+#############################
+
+pred <- ini$predictorMatrix
+
+diag(pred) <- 0
+
+#############################
+# Run MICE
+#############################
+
+imp <- mice(
+  df,
+  m = 5,
+  method = meth,
+  predictorMatrix = pred,
+  maxit = 20,
+  seed = 2026
+)
+
+#############################
+# Create completed datasets
+#############################
+
+imp_list <- lapply(
+  seq_len(imp$m),
+  complete,
+  data = imp
+)
+
+#############################
+# Clean imputed datasets
+#############################
+
+imp_list <- lapply(
+  imp_list,
+  function(dat) {
+    
+    dat <- dat %>%
+      mutate(
+        across(
+          where(is.character),
+          as.factor
+        )
+      )
+    
+    dat
+  }
+)
+
+#############################
+# 8. BCF Parameter Sets
+#############################
+
+# Primary analysis prior
+
+primary_pars <- list(
+  ntree_control = 200,
+  base_control = 0.95,
+  power_control = 2,
+  ntree_moderate = 50,
+  base_moderate = 0.25,
+  power_moderate = 3
+)
+
+# Sensitivity analysis prior
+
+sensitivity_pars <- list(
+  ntree_control = 200,
+  base_control = 0.95,
+  power_control = 2,
+  ntree_moderate = 200,
+  base_moderate = 0.95,
+  power_moderate = 2
+)
+
+#############################
+# 9. Generic BCF Function
+#############################
+
+fit_bcf <- function(
+    data,
+    outcome_var,
+    pars,
+    nburn = 2000,
+    nsim = 5000
+) {
+  
+  #############################
+  # Outcome
+  #############################
+  
+  y <- as.numeric(
+    data[[outcome_var]]
+  )
+  
+  #############################
+  # Treatment
+  #############################
+  
+  z <- as.numeric(
+    data$z
+  )
+  
+  #############################
+  # Covariates
+  #############################
+  
+  X <- data[, covars]
+  
+  #############################
+  # Convert factors/logicals
+  #############################
+  
+  X <- X %>%
+    mutate(
+      across(
+        where(is.factor),
+        as.numeric
+      ),
+      across(
+        where(is.logical),
+        as.numeric
+      )
+    )
+  
+  #############################
+  # Convert to matrix
+  #############################
+  
+  X <- as.matrix(X)
+  
+  #############################
+  # Keep complete cases
+  #############################
+  
+  keep <- complete.cases(
+    y,
+    z,
+    X
+  )
+  
+  y <- y[keep]
+  
+  z <- z[keep]
+  
+  X <- X[keep, ]
+  
+  #############################
+  # Diagnostics
+  #############################
+  
+  cat("\nDiagnostics\n")
+  
+  cat(
+    "Outcome:",
+    outcome_var,
+    "\n"
+  )
+  
+  cat(
+    "N:",
+    length(y),
+    "\n"
+  )
+  
+  cat(
+    "Treated:",
+    sum(z == 1),
+    "\n"
+  )
+  
+  cat(
+    "Control:",
+    sum(z == 0),
+    "\n"
+  )
+  
+  #############################
+  # Propensity scores
+  #############################
+  
+  # Randomized trial:
+  # use empirical treatment prob
+  
+  pihat <- rep(
+    mean(z),
+    length(z)
+  )
+  
+  #############################
+  # Fit BCF
+  #############################
+  
+  fit <- bcf(
+    y = y,
+    z = z,
+    x_control = X,
+    x_moderate = X,
+    pihat = pihat,
+    nburn = nburn,
+    nsim = nsim,
+    ntree_control = pars$ntree_control,
+    base_control = pars$base_control,
+    power_control = pars$power_control,
+    ntree_moderate = pars$ntree_moderate,
+    base_moderate = pars$base_moderate,
+    power_moderate = pars$power_moderate
+  )
+  
+  return(fit)
+}
+
+#############################
+# 10. Run Across Imputations
+#############################
+
+fit_all_imputations <- function(
+    outcome_var,
+    pars
+) {
+  
+  models <- lapply(
+    
+    imp_list,
+    
+    function(dat) {
+      
+      tryCatch({
+        
+        fit_bcf(
+          data = dat,
+          outcome_var = outcome_var,
+          pars = pars
+        )
+        
+      }, error = function(e) {
+        
+        print(e)
+        
+        return(NULL)
+      })
+    }
+  )
+  
+  #############################
+  # Remove failed fits
+  #############################
+  
+  models <- Filter(
+    Negate(is.null),
+    models
+  )
+  
+  return(models)
+}
+
+#############################
+# 11. Primary Analysis
+#############################
+
+bcf_exec_models <- fit_all_imputations(
+  outcome_var = "exec_change",
+  pars = primary_pars
+)
+
+#############################
+# 12. Extract Posterior Tau
+#############################
+
+extract_tau <- function(fit) {
+  
+  tau <- fit$tauhats
+  
+  tau <- as.matrix(tau)
+  
+  return(tau)
+}
+
+tau_list <- lapply(
+  bcf_exec_models,
+  extract_tau
+)
+
+#############################
+# Pool posterior draws
+#############################
+
+pooled_tau <- do.call(
+  rbind,
+  tau_list
+)
+
+#############################
+# Inspect pooled tau
+#############################
+
+dim(pooled_tau)
+
+glimpse(
+  as.data.frame(
+    pooled_tau[, 1:5]
+  )
+)
+
+#############################
+# 13. Overall ATE
+#############################
+
+# One ATE per posterior draw
+
+ate_draws <- rowMeans(
+  pooled_tau
+)
+
+#############################
+# Posterior summaries
+#############################
+
+overall_ate <- mean(
+  ate_draws
+)
+
+ate_ci <- quantile(
+  ate_draws,
+  probs = c(0.025, 0.975)
+)
+
+p_gt_zero <- mean(
+  ate_draws > 0
+)
+
+#############################
+# Print results
+#############################
+
+cat("\nOverall ATE\n")
+
+print(overall_ate)
+
+cat("\n95% Credible Interval\n")
+
+print(ate_ci)
+
+cat("\nP(ATE > 0)\n")
+
+print(p_gt_zero)
+
+#############################
+# 14. Subject-level CATE
+#############################
+
+cate <- colMeans(
+  pooled_tau
+)
+
+analysis_df <- imp_list[[1]]
+
+analysis_df$cate <- cate
+
+#############################
+# 15. Pre-specified Subgroups
+#############################
+
+subgroup_effect <- function(
+    idx1,
+    idx2
+) {
+  
+  g1 <- rowMeans(
+    pooled_tau[, idx1, drop = FALSE]
+  )
+  
+  g2 <- rowMeans(
+    pooled_tau[, idx2, drop = FALSE]
+  )
+  
+  diff <- g1 - g2
+  
+  tibble(
+    mean = mean(diff),
+    lo = quantile(diff, 0.025),
+    hi = quantile(diff, 0.975),
+    p_gt_0 = mean(diff > 0)
+  )
+}
+
+#############################
+# Sex subgroup
+#############################
+
+sex_idx <- list(
+  male = which(
+    analysis_df$male.x == 1
+  ),
+  female = which(
+    analysis_df$male.x == 0
+  )
+)
+
+sex_results <- subgroup_effect(
+  sex_idx$male,
+  sex_idx$female
+)
+
+print(sex_results)
+
+#############################
+# Age subgroup
+#############################
+
+age_idx <- list(
+  lt60 = which(
+    analysis_df$Age < 60
+  ),
+  ge60 = which(
+    analysis_df$Age >= 60
+  )
+)
+
+age_results <- subgroup_effect(
+  age_idx$lt60,
+  age_idx$ge60
+)
+
+print(age_results)
+
+#############################
+# 16. Density Plot
+#############################
+
+plot_df <- tibble(
+  
+  male = rowMeans(
+    pooled_tau[
+      ,
+      sex_idx$male,
+      drop = FALSE
+    ]
+  ),
+  
+  female = rowMeans(
+    pooled_tau[
+      ,
+      sex_idx$female,
+      drop = FALSE
+    ]
+  )
+)
+
+plot_df <- pivot_longer(
+  plot_df,
+  cols = everything(),
+  names_to = "group",
+  values_to = "value"
+)
+
+ggplot(
+  plot_df,
+  aes(
+    x = value,
+    fill = group
+  )
+) +
+  geom_density(alpha = 0.4) +
+  theme_bw()
+
+#############################
+# 17. CART Subgroup Discovery
+#############################
+
+cart_formula <- as.formula(
+  paste(
+    "cate ~",
+    paste(covars, collapse = " + ")
+  )
+)
+
+cart_fit <- rpart(
+  cart_formula,
+  data = analysis_df,
+  method = "anova",
+  control = rpart.control(
+    cp = 0.01,
+    minbucket = 20,
+    maxdepth = 3
+  )
+)
+
+rpart.plot(
+  cart_fit,
+  type = 3,
+  extra = 101
+)
+
+#############################
+# 18. Terminal Node Effects
+#############################
+
+nodes <- cart_fit$where
+
+analysis_df$node <- nodes
+
+node_results <- lapply(
+  
+  unique(nodes),
+  
+  function(n) {
+    
+    idx <- which(
+      nodes == n
+    )
+    
+    draw <- rowMeans(
+      pooled_tau[
+        ,
+        idx,
+        drop = FALSE
+      ]
+    )
+    
+    tibble(
+      node = n,
+      mean = mean(draw),
+      lo = quantile(draw, 0.025),
+      hi = quantile(draw, 0.975),
+      p_gt_0 = mean(draw > 0)
+    )
+  }
+  
+) %>%
+  
+  bind_rows()
+
+print(node_results)
+
+#############################
+# 19. Save Results
+#############################
+
+write.csv(
+  node_results,
+  "subgroup_results.csv",
+  row.names = FALSE
+)
+
+saveRDS(
+  bcf_exec_models,
+  "bcf_exec_models.rds"
+)
+
+saveRDS(
+  pooled_tau,
+  "pooled_tau.rds"
+)
+
+
+#vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+
 #############################
 # 3. Merge Data
 #############################
@@ -531,3 +1275,505 @@ write.csv(node_results, "subgroup_results.csv", row.names = FALSE)
 
 saveRDS(bcf_primary_models, "bcf_models.rds")
 saveRDS(pooled_tau, "pooled_tau.rds")
+
+
+
+
+
+
+
+#### ************ attempt 2 ********************* ####
+
+
+############################################################
+# Bayesian Causal Forest (BCF) Pipeline
+# Debugged and consolidated
+############################################################
+
+# Install source-compiled packages first (run once)
+# install.packages("Rcpp",        type = "source")
+# install.packages("RcppParallel", type = "source")
+# install.packages("bcf",         type = "source")
+
+#############################
+# 1. Packages
+#############################
+
+pkgs <- c(
+  "mice", "bcf", "dplyr", "purrr", "ggplot2",
+  "rpart", "rpart.plot", "posterior",
+  "tidyr", "readxl", "tibble"
+)
+
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+
+if (length(to_install)) {
+  install.packages(to_install)
+}
+
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+set.seed(2026)
+
+#############################
+# 2. Load Data
+#############################
+
+df_main <- read_excel("Nikki Smith R01 Subset (1).xls")
+
+df_add  <- read_excel("PSmith R01 additional data (1).xlsx")
+
+#############################
+# 3. Merge Data
+#############################
+
+common_cols <- intersect(names(df_main), names(df_add))
+print(common_cols)
+
+# Use first common column as ID; replace with correct ID if needed
+id_var <- common_cols[1]
+
+df <- left_join(df_main, df_add, by = id_var)
+
+#############################
+# 4. Data Cleaning
+#############################
+
+# Remove subject ID
+df <- df %>% select(-SUBID)
+
+# Convert "." strings to NA then numeric
+char_numeric_vars <- c(
+  "homadiff",   "bhitoidiff", "bhio2diff",
+  "vmro2diff",  "vmrtoidiff", "nirscogdiff",
+  "nirso2diff", "nirstoidiff","veldiff", "flowdiff"
+)
+
+df <- df %>%
+  mutate(across(all_of(char_numeric_vars), ~ na_if(., "."))) %>%
+  mutate(across(all_of(char_numeric_vars), as.numeric))
+
+# Remove duplicate sex / gender columns
+df <- df %>% select(-male.y, -Gender)
+
+#############################
+# 5. Define Variables
+#############################
+
+# Treatment: SEPA = 0, C-LIFE = 1
+df$z <- ifelse(df$group == "C-LIFE", 1L, 0L)
+
+# Outcome change scores
+df$exec_change  <- df$pjexect2r - df$pjexect1r
+df$mem_change   <- df$memt2r    - df$memt1r
+df$speed_change <- df$speedt2r  - df$speedt1r
+
+# Covariates
+covars <- c(
+  # demographics
+  "Age", "male.x", "minority", "eduyrs",
+  # baseline cognition
+  "speedt1r", "memt1r", "pjexect1r",
+  # blood pressure
+  "clinicdbpt1", "clinicsbpt1", "MeanSys24hrT1", "MeanDia24hrT1",
+  # fitness
+  "avgstepst1", "pkvo2t1",
+  # metabolic
+  "Glucose", "Insulin", "HbA1C",
+  # lipids
+  "totChol", "Trigly", "HDL", "LDL",
+  # vascular
+  "fmdt1", "fart1",
+  # adiposity
+  "wthrt1",
+  # metabolic syndrome
+  "metsynst1"
+)
+
+#############################
+# 6. Inspect Data
+#############################
+
+glimpse(df)
+
+#############################
+# 7. Multiple Imputation
+#############################
+
+ini  <- mice(df, maxit = 0)
+meth <- ini$method
+meth[meth != ""] <- "pmm"          # PMM for all continuous vars
+
+pred      <- ini$predictorMatrix
+diag(pred) <- 0
+
+imp <- mice(
+  df,
+  m             = 5,
+  method        = meth,
+  predictorMatrix = pred,
+  maxit         = 20,
+  seed          = 2026
+)
+
+# List of completed datasets, all factor/logical cols → integer
+imp_list <- lapply(seq_len(imp$m), complete, data = imp)
+
+imp_list <- lapply(imp_list, function(dat) {
+  dat %>%
+    mutate(across(where(is.character), as.factor)) %>%
+    mutate(across(where(is.factor),   as.integer)) %>%
+    mutate(across(where(is.logical),  as.integer))
+})
+
+#############################
+# 8. BCF Parameter Sets
+#############################
+
+primary_pars <- list(
+  ntree_control  = 200,
+  base_control   = 0.95,
+  power_control  = 2,
+  ntree_moderate = 50,
+  base_moderate  = 0.25,
+  power_moderate = 3
+)
+
+sensitivity_pars <- list(
+  ntree_control  = 200,
+  base_control   = 0.95,
+  power_control  = 2,
+  ntree_moderate = 200,
+  base_moderate  = 0.95,
+  power_moderate = 2
+)
+
+#############################
+# 9. BCF Fit Function
+#############################
+
+fit_bcf <- function(data,
+                    outcome_var,
+                    pars,
+                    nburn = 2000,
+                    nsim  = 5000) {
+  
+  y <- as.numeric(data[[outcome_var]])
+  z <- as.numeric(data$z)
+  
+  X <- data[, covars, drop = FALSE] %>%
+    mutate(across(where(is.factor),  as.numeric),
+           across(where(is.logical), as.numeric)) %>%
+    as.matrix()
+  
+  # BUG FIX: complete.cases needs a single data-frame, not separate objects
+  keep <- complete.cases(data.frame(y = y, z = z, X))
+  
+  y <- y[keep]
+  z <- z[keep]
+  X <- X[keep, , drop = FALSE]
+  
+  cat("\n--- Diagnostics ---\n")
+  cat("Outcome:", outcome_var, "\n")
+  cat("N:", length(y), "\n")
+  cat("Treated:", sum(z == 1), "\n")
+  cat("Control:", sum(z == 0), "\n")
+  
+  # Randomised trial → use empirical treatment probability
+  pihat <- rep(mean(z), length(z))
+  
+  fit <- bcf(
+    y              = y,
+    z              = z,
+    x_control      = X,
+    x_moderate     = X,
+    pihat          = pihat,
+    nburn          = nburn,
+    nsim           = nsim,
+    ntree_control  = pars$ntree_control,
+    base_control   = pars$base_control,
+    power_control  = pars$power_control,
+    ntree_moderate = pars$ntree_moderate,
+    base_moderate  = pars$base_moderate,
+    power_moderate = pars$power_moderate
+  )
+  
+  return(fit)
+}
+
+#############################
+# 10. Run Across Imputations
+#############################
+
+fit_all_imputations <- function(outcome_var, pars) {
+  
+  models <- lapply(imp_list, function(dat) {
+    tryCatch(
+      fit_bcf(data = dat, outcome_var = outcome_var, pars = pars),
+      error = function(e) { print(e); return(NULL) }
+    )
+  })
+  
+  Filter(Negate(is.null), models)
+}
+
+#############################
+# 11. Primary Analysis
+#############################
+
+bcf_exec_models <- fit_all_imputations(
+  outcome_var = "exec_change",
+  pars        = primary_pars
+)
+
+cat("\nSuccessful models:", length(bcf_exec_models), "\n")
+
+#############################
+# 12. Extract Posterior Tau
+#############################
+
+# BUG FIX: BCF stores individual treatment effect draws in $tauhats,
+#           not $tau. Rows = posterior draws, cols = subjects.
+
+extract_tau <- function(fit) {
+  if (is.null(fit))             return(NULL)
+  if (is.null(fit$tauhats))     stop("tauhats not found in BCF object")
+  as.matrix(fit$tauhats)
+}
+
+tau_list   <- lapply(bcf_exec_models, extract_tau)
+tau_list   <- Filter(Negate(is.null), tau_list)
+lapply(tau_list, dim)          # sanity check dimensions
+
+# Pool posterior draws across imputations
+pooled_tau <- do.call(rbind, tau_list)
+cat("\nPooled tau dims:", dim(pooled_tau), "\n")
+
+#############################
+# 13. Overall ATE
+#############################
+
+ate_draws   <- rowMeans(pooled_tau)
+overall_ate <- mean(ate_draws)
+ate_ci      <- quantile(ate_draws, probs = c(0.025, 0.975))
+p_gt_zero   <- mean(ate_draws > 0)
+
+cat("\nOverall ATE:", overall_ate, "\n")
+cat("95% Credible Interval:\n"); print(ate_ci)
+cat("P(ATE > 0):", p_gt_zero, "\n")
+
+#############################
+# 14. Subject-level CATE
+#############################
+
+cate        <- colMeans(pooled_tau)
+analysis_df <- imp_list[[1]]
+analysis_df$cate <- cate
+
+#############################
+# 15. Subgroup Effect Function
+#############################
+
+subgroup_effect <- function(idx_list, label1, label2) {
+  
+  idx1 <- idx_list[[1]]
+  idx2 <- idx_list[[2]]
+  
+  if (length(idx1) == 0 || length(idx2) == 0)
+    stop("Empty subgroup — check variable coding.")
+  
+  g1   <- rowMeans(pooled_tau[, idx1, drop = FALSE])
+  g2   <- rowMeans(pooled_tau[, idx2, drop = FALSE])
+  diff <- g1 - g2
+  
+  tibble(
+    group1  = label1,
+    group2  = label2,
+    mean    = mean(diff),
+    lo      = quantile(diff, 0.025),
+    hi      = quantile(diff, 0.975),
+    p_gt_0  = mean(diff > 0)
+  )
+}
+
+#############################
+# 16. Pre-specified Subgroups
+#
+# BUG FIX: original second-draft used analysis_df$sex and
+#           analysis_df$age (lowercase), which don't exist.
+#           Actual columns are male.x (0/1) and Age (capital A).
+#############################
+
+# Sex
+sex_idx <- list(
+  male   = which(analysis_df$male.x == 1),
+  female = which(analysis_df$male.x == 0)
+)
+
+sex_results <- subgroup_effect(sex_idx, "Male", "Female")
+print(sex_results)
+
+# Age
+age_idx <- list(
+  lt60 = which(analysis_df$Age <  60),
+  ge60 = which(analysis_df$Age >= 60)
+)
+
+age_results <- subgroup_effect(age_idx, "<60", ">=60")
+print(age_results)
+
+#############################
+# 17. Density Plot (target output)
+#
+# Two-panel figure matching the screenshot:
+#   Left:  overlapping densities for each subgroup's ATE
+#   Right: density of the between-group difference
+#############################
+
+# --- Posterior draws per subgroup ---
+male_draws   <- rowMeans(pooled_tau[, sex_idx$male,   drop = FALSE])
+female_draws <- rowMeans(pooled_tau[, sex_idx$female, drop = FALSE])
+diff_draws   <- male_draws - female_draws
+
+# --- Panel A: overlapping subgroup densities ---
+plot_df <- tibble(
+  `Men`   = male_draws,
+  `Women` = female_draws
+) %>%
+  pivot_longer(
+    cols      = everything(),
+    names_to  = "group",
+    values_to = "value"
+  )
+
+p_dens <- ggplot(plot_df, aes(x = value, fill = group)) +
+  geom_density(alpha = 0.4) +
+  labs(
+    x    = "Subgroup treatment effect",
+    y    = "Posterior density",
+    fill = "Group"
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+# --- Panel B: difference density ---
+diff_df <- tibble(value = diff_draws)
+
+p_diff <- ggplot(diff_df, aes(x = value)) +
+  geom_density(fill = "grey60", alpha = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(
+    x = "Difference",
+    y = "Density"
+  ) +
+  theme_bw()
+
+# --- Combined plot (requires patchwork; falls back to side-by-side base) ---
+if (!requireNamespace("patchwork", quietly = TRUE)) {
+  install.packages("patchwork")
+}
+library(patchwork)
+
+combined_plot <- p_dens + p_diff +
+  plot_annotation(
+    caption = "Left: posterior ATE by subgroup. Right: posterior difference (Male − Female)."
+  )
+
+print(combined_plot)
+
+#############################
+# 18. CART Subgroup Discovery
+#############################
+
+cart_formula <- as.formula(
+  paste("cate ~", paste(covars, collapse = " + "))
+)
+
+cart_fit <- rpart(
+  cart_formula,
+  data    = analysis_df,
+  method  = "anova",
+  control = rpart.control(cp = 0.01, minbucket = 20, maxdepth = 3)
+)
+
+rpart.plot(cart_fit, type = 3, extra = 101)
+
+#############################
+# 19. Terminal Node Effects
+#############################
+
+nodes            <- cart_fit$where
+analysis_df$node <- nodes
+
+node_results <- lapply(unique(nodes), function(n) {
+  
+  idx  <- which(nodes == n)
+  draw <- rowMeans(pooled_tau[, idx, drop = FALSE])
+  
+  tibble(
+    node   = n,
+    mean   = mean(draw),
+    lo     = quantile(draw, 0.025),
+    hi     = quantile(draw, 0.975),
+    p_gt_0 = mean(draw > 0)
+  )
+  
+}) %>% bind_rows()
+
+print(node_results)
+
+#############################
+# 20. Summary Table
+#    (matches mock table in screenshot)
+#############################
+
+summary_table <- bind_rows(
+  tibble(
+    subgroup1  = "Overall",
+    subgroup2  = "—",
+    ate        = overall_ate,
+    ci_lo      = ate_ci[[1]],
+    ci_hi      = ate_ci[[2]],
+    p_gt_zero  = p_gt_zero
+  ),
+  sex_results %>% transmute(
+    subgroup1 = group1,
+    subgroup2 = group2,
+    ate       = mean,
+    ci_lo     = lo,
+    ci_hi     = hi,
+    p_gt_zero = p_gt_0
+  ),
+  age_results %>% transmute(
+    subgroup1 = group1,
+    subgroup2 = group2,
+    ate       = mean,
+    ci_lo     = lo,
+    ci_hi     = hi,
+    p_gt_zero = p_gt_0
+  )
+) %>%
+  mutate(
+    `Posterior Mean ATE (95% CI)` = sprintf(
+      "%.2f (%.2f, %.2f)", ate, ci_lo, ci_hi
+    ),
+    `Pr(τ₁ − τ₂ > 0)` = round(p_gt_zero, 2)
+  ) %>%
+  select(
+    `Subgroup 1`             = subgroup1,
+    `Subgroup 2`             = subgroup2,
+    `Posterior Mean ATE (95% CI)`,
+    `Pr(τ₁ − τ₂ > 0)`
+  )
+
+print(summary_table)
+
+#############################
+# 21. Save Results
+#############################
+
+write.csv(node_results,  "subgroup_results.csv",   row.names = FALSE)
+write.csv(summary_table, "summary_table.csv",       row.names = FALSE)
+
+saveRDS(bcf_exec_models, "bcf_exec_models.rds")
+saveRDS(pooled_tau,      "pooled_tau.rds")
