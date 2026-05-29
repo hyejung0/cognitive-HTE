@@ -386,12 +386,18 @@ if (!requireNamespace("patchwork", quietly = TRUE)) {
 }
 library(patchwork)
 
+library(patchwork)
+
 combined_plot <- p_dens + p_diff +
   plot_annotation(
     caption = "Left: posterior ATE by subgroup. Right: posterior difference (Male − Female)."
   )
 
+dev.new(); print(combined_plot)
+dev.new(); rpart.plot(cart_fit, type = 3, extra = 101)
+
 print(combined_plot)
+
 
 #############################
 # 18. CART Subgroup Discovery
