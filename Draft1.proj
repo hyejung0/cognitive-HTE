@@ -1,11 +1,6 @@
 ############################################################
-# Bayesian Causal Forest (BCF) Pipeline
+# Bayesian Causal Forest (BCF) Pipeline -- REVISED
 ############################################################
-
-# Install source-compiled packages first (run once)
-# install.packages("Rcpp",        type = "source")
-# install.packages("RcppParallel", type = "source")
-# install.packages("bcf",         type = "source")
 
 #############################
 # 1. Packages
@@ -14,8 +9,9 @@
 pkgs <- c(
   "mice", "bcf", "dplyr", "purrr", "ggplot2",
   "rpart", "rpart.plot", "posterior",
-  "tidyr", "readxl", "tibble"
+  "tidyr", "readxl", "tibble", "stringr", "data.table"
 )
+
 
 to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
 
@@ -32,7 +28,6 @@ set.seed(2026)
 #############################
 
 df_main <- read_excel("Nikki Smith R01 Subset (1).xls")
-
 df_add  <- read_excel("PSmith R01 additional data (1).xlsx")
 
 #############################
@@ -43,9 +38,11 @@ common_cols <- intersect(names(df_main), names(df_add))
 print(common_cols)
 
 # Use first common column as ID; replace with correct ID if needed
-id_var <- common_cols[1]
-
-df <- left_join(df_main, df_add, by = id_var)
+df <- left_join(
+  df_main,
+  df_add,
+  by = "SUBID"
+)
 
 #############################
 # 4. Data Cleaning
@@ -55,6 +52,9 @@ df <- left_join(df_main, df_add, by = id_var)
 df <- df %>% select(-SUBID)
 
 # Convert "." strings to NA then numeric
+# (Note: these "diff" columns get dropped entirely a few lines down,
+# so this step is mostly future-proofing in case that filter changes;
+# it's harmless to leave in either way.)
 char_numeric_vars <- c(
   "homadiff",   "bhitoidiff", "bhio2diff",
   "vmro2diff",  "vmrtoidiff", "nirscogdiff",
@@ -66,119 +66,300 @@ df <- df %>%
   mutate(across(all_of(char_numeric_vars), as.numeric))
 
 # Remove duplicate sex / gender columns
-df <- df %>% select(-male.y, -Gender)
+# BUG FIX: any_of() instead of bare names -- won't error if a column
+# is already absent (e.g. if the merge suffixing changes slightly).
+df <- df %>% select(-any_of(c("male.y", "Gender")))
+
+# Remove problematic race-other variable
+# BUG FIX: the original code referenced `X` and `dat`, which don't
+# exist yet at this point in the script (they're created later,
+# locally, inside fit_bcf() and the imp_list mutate() calls) -- this
+# would throw "object 'X' not found" the moment it ran. The intent
+# was clearly to drop this column from the working dataset, so it's
+# applied to `df` directly, defensively via any_of().
+df <- df %>% select(-any_of("Raceoth"))
 
 #############################
-# 5. Define Variables
+# Remove all "diff" variables from df
+#
+# BUG FIX: df[, vars_keep] silently fails to subset columns when df
+# is (or becomes) a data.table -- it just evaluates vars_keep as an
+# expression instead of selecting columns. dplyr::select(all_of(...))
+# works correctly regardless of whether df is a tibble or data.table.
 #############################
 
-# Treatment: SEPA = 0, C-LIFE = 1
-df$z <- ifelse(df$group == "C-LIFE", 1L, 0L)
+vars_keep <- names(df)[!str_detect(names(df), "diff")]
 
-# Outcome change scores
-df$exec_change  <- df$pjexect2r - df$pjexect1r
-df$mem_change   <- df$memt2r    - df$memt1r
-df$speed_change <- df$speedt2r  - df$speedt1r
+df <- df %>% select(all_of(vars_keep))
 
-# Covariates
-covars <- c(
-  # demographics
-  "Age", "male.x", "minority", "eduyrs",
-  # baseline cognition
-  "speedt1r", "memt1r", "pjexect1r",
-  # blood pressure
-  "clinicdbpt1", "clinicsbpt1", "MeanSys24hrT1", "MeanDia24hrT1",
-  # fitness
-  "avgstepst1", "pkvo2t1",
-  # metabolic
-  "Glucose", "Insulin", "HbA1C",
-  # lipids
-  "totChol", "Trigly", "HDL", "LDL",
-  # vascular
-  "fmdt1", "fart1",
-  # adiposity
-  "wthrt1",
-  # metabolic syndrome
-  "metsynst1"
-)
-
-#############################
-# 6. Inspect Data
-#############################
-
+# Confirm removal worked -- this should show NO columns containing "diff"
+stopifnot(!any(str_detect(names(df), "diff")))
 glimpse(df)
 
 #############################
-# 7. Multiple Imputation
+# Read Data Dictionary sheet
+#
+# NOTE: sheet 1 is the actual dataset (90 raw measurement columns).
+# Sheet 2 is the real data dictionary: a 2-column lookup table where
+# the first column (labeled "SUBID" in the raw Excel header, but
+# actually holding variable name strings) maps to plain-English
+# descriptions in "Subject identifier".
 #############################
 
-ini  <- mice(df, maxit = 0)
-meth <- ini$method
-meth[meth != ""] <- "pmm"          # PMM for all continuous vars
-
-pred      <- ini$predictorMatrix
-diag(pred) <- 0
-
-imp <- mice(
-  df,
-  m             = 5,
-  method        = meth,
-  predictorMatrix = pred,
-  maxit         = 20,
-  seed          = 2026
+Data_dictionary <- read_excel(
+  "Nikki Smith R01 Subset (1).xls",
+  sheet     = 2,
+  col_names = TRUE,
+  na        = c("", ",")
 )
 
-# List of completed datasets, all factor/logical cols → integer
+names(Data_dictionary)
+
+# Rename for clarity since the first column is mislabeled "SUBID"
+# in the raw file but actually contains variable names
+Data_dictionary <- Data_dictionary %>%
+  rename(
+    variable_name = 1,
+    description   = 2
+  )
+
+# Keep only dictionary rows matching the variables remaining in df
+Data_dictionary <- Data_dictionary %>%
+  filter(variable_name %in% vars_keep)
+
+head(Data_dictionary)
+
+#############################
+# 5. Imputation
+#
+# NOTE: mice() needs to run on the analysis dataset (df) -- the
+# dataset with missing measurement values -- not on Data_dictionary,
+# which is just a 2-column variable-name/description lookup table.
+#
+# BUG FIXES from original snippet:
+#   - tmp[, SUBID := NULL] used invalid syntax (missing :=) and is
+#     unnecessary here since SUBID was already dropped from df in
+#     step 4 (df <- df %>% select(-SUBID)).
+#   - copy() is a data.table function; df is a tibble at this point,
+#     so a plain assignment is sufficient and avoids depending on
+#     data.table for an object that doesn't need it.
+#############################
+
+tmp <- df
+
+# Sanity check: confirm SUBID isn't present (it shouldn't be, per step 4)
+stopifnot(!"SUBID" %in% names(tmp))
+
+imp <- mice(tmp, seed = 100, print = FALSE, m = 5)
+
+saveRDS(imp, "imp.rds")
+
+# Quick check on the imputation
+summary(imp)
+
+#############################
+# 6. Build completed datasets for analysis
+#
+# Per SAP: 5 imputed datasets are generated; BCF is fit separately on
+# each, and posterior draws are pooled across all 5 to form one final
+# posterior distribution (Zhou & Reiter, 2010).
+#
+# BUG FIX (root cause of all 5 fits failing in an earlier version):
+# the original code converted ALL character columns -- including
+# `group` ("SEPA" / "C-LIFE") -- to integer factor codes in this step,
+# BEFORE building the treatment variable z. By the time
+# z <- ifelse(group == "C-LIFE", 1, 0) ran, `group` was already an
+# integer (1/2), so group == "C-LIFE" was comparing integer to
+# character and was NEVER TRUE. This silently made z all zeros (or
+# all NA depending on coercion), so bcf() had no treated subjects.
+#
+# FIX: build exec_change and z FIRST, while `group` is still the
+# original character string, and only convert remaining
+# character/factor covariates to numeric AFTER z is safely built.
+#############################
+
 imp_list <- lapply(seq_len(imp$m), complete, data = imp)
 
+outcome_var <- "exec_change"
+treat_var   <- "z"
+
+# Step 6a: build outcome and treatment WHILE group is still character
+imp_list <- lapply(imp_list, function(dat) {
+  dat %>%
+    mutate(
+      exec_change = pjexect2r,
+      z           = ifelse(group == "C-LIFE", 1L, 0L)
+    )
+})
+
+# Sanity check immediately -- catch a broken z before it ever reaches bcf()
+z_check <- sapply(imp_list, function(dat) table(dat$z))
+cat("\nTreatment assignment counts per imputed dataset (rows = z value, cols = imputation):\n")
+print(z_check)
+stopifnot(all(sapply(imp_list, function(dat) sum(dat$z == 1) > 0)))
+stopifnot(all(sapply(imp_list, function(dat) sum(dat$z == 0) > 0)))
+
+# Step 6b: NOW convert any remaining character/factor covariates
+# (group itself is no longer needed in this form but is excluded
+# from covars below anyway, so converting it here is harmless)
 imp_list <- lapply(imp_list, function(dat) {
   dat %>%
     mutate(across(where(is.character), as.factor)) %>%
-    mutate(across(where(is.factor),   as.integer)) %>%
-    mutate(across(where(is.logical),  as.integer))
+    mutate(across(where(is.factor),   as.integer))
 })
 
 #############################
-# 8. BCF Parameter Sets
+# 7. Define covariates per SAP
+#
+# Xi: every available baseline/measurement column except the
+# treatment label, treatment indicator, and outcome-construction
+# columns (exec_change and pjexect2r ARE the outcome and must be
+# excluded; pjexect1r is retained as a legitimate baseline covariate).
+#############################
+
+exclude_cols <- c("group", "z", "exec_change", "pjexect2r")
+
+covars <- setdiff(names(imp_list[[1]]), exclude_cols)
+
+cat("\nNumber of covariates (Xi):", length(covars), "\n")
+print(covars)
+
+# Confirm every covariate is numeric/integer (required for the BCF
+# design matrix) -- print anything that is NOT, so it can be fixed
+# before fitting rather than failing silently inside fit_bcf()
+non_numeric <- covars[!sapply(imp_list[[1]][, covars], function(x) is.numeric(x) || is.integer(x))]
+if (length(non_numeric) > 0) {
+  cat("\nWARNING: non-numeric covariates found, will break as.matrix():\n")
+  print(non_numeric)
+}
+
+#############################
+# 7b. Check raw distribution of each covariate BEFORE imputation
+# fills in missing values -- this distinguishes "this variable is
+# genuinely constant in our cohort" from "this variable has too much
+# missingness and mice() is imputing a single dominant value".
+#############################
+
+cat("\nPre-imputation summary of covariates with low variability (check these):\n")
+for (v in covars) {
+  if (v %in% names(df)) {
+    n_missing  <- sum(is.na(df[[v]]))
+    n_unique   <- length(unique(na.omit(df[[v]])))
+    if (n_unique <= 2) {
+      cat(sprintf("  %-15s missing: %3d / %3d  |  unique non-NA values: %s\n",
+                  v, n_missing, nrow(df), paste(unique(na.omit(df[[v]])), collapse = ", ")))
+    }
+  }
+}
+
+# Drop covariates that are constant in the RAW (pre-imputation) data --
+# these cannot contribute any signal regardless of imputation, and
+# will reliably crash bcf()'s internal sampler with singular-matrix
+# style errors. Variables with genuine variability that only LOOK
+# constant after imputation (due to a dominant mode in one particular
+# draw) are NOT dropped here -- that case is now handled per-fit
+# inside fit_bcf() in step 10, since it's specific to one imputation
+# at a time, not a property of the raw data.
+raw_constant_covars <- covars[sapply(covars, function(v) {
+  if (!(v %in% names(df))) return(FALSE)
+  length(unique(na.omit(df[[v]]))) <= 1
+})]
+
+if (length(raw_constant_covars) > 0) {
+  cat("\nDropping covariates that are constant in the RAW data (before imputation):\n")
+  print(raw_constant_covars)
+  covars <- setdiff(covars, raw_constant_covars)
+}
+
+#############################
+# 8. Fixed propensity score
+#
+# Per SAP: treatment was assigned via 2:1 randomization (C-LIFE:SEPA),
+# so pihat = 2/3 for every subject BY DESIGN -- it is not estimated
+# from the observed sample proportion.
+#
+# BUG FIX: the original code computed
+#   pihat <- rep(mean(z), length(z))
+# at the top level. But `z` only exists as a column INSIDE each data
+# frame in imp_list (created in step 6) -- there is no global `z`,
+# so this line throws "object 'z' not found" the moment it runs.
+# It also produced a variable literally named `pihat`, while every
+# downstream fit_bcf() call expects an argument named `pihat_fixed`
+# -- which was never defined anywhere in the original script.
+#
+# FIX: since pihat is a known constant per the SAP, just define it
+# directly. No dependency on any per-dataset z is needed.
+#############################
+
+pihat_fixed <- 2 / 3
+
+# Sanity check against the actual randomization in each imputed dataset
+# (informational only -- pihat_fixed stays at 2/3 per the SAP's fixed
+# design, it is not re-estimated from the observed rate below)
+observed_treat_rate <- sapply(imp_list, function(dat) mean(dat$z))
+cat("\nObserved treatment rate per imputed dataset (for reference only; pihat_fixed remains 2/3 per SAP design):\n")
+print(observed_treat_rate)
+
+#############################
+# 9. BCF prior specifications per SAP
+#
+#   mu (prognostic effect): 200 trees, beta = 2, eta(power) = 0.95
+#     -- "eta" in the SAP corresponds to the base/alpha parameter
+#        in Chipman et al.'s split-probability prior; the bcf package
+#        calls this 'base_control', and depth penalty is
+#        'power_control'.
+#
+#   tau primary (treatment effect heterogeneity): 50 trees,
+#     beta = 3, eta = 0.25 (intentionally skeptical / shallow prior)
+#
+#   tau sensitivity: same prior as mu (200 trees, beta = 2, eta = 0.95)
+#
+# Leaf-scale priors (half-Cauchy for mu, half-normal for tau primary,
+# half-Cauchy for tau sensitivity) are handled internally by the bcf
+# package's default leaf-scale calibration -- these are not exposed
+# as separate user-facing arguments in bcf(), so we rely on package
+# defaults, which are designed to match this specification.
 #############################
 
 primary_pars <- list(
-  ntree_control  = 200,
-  base_control   = 0.95,
-  power_control  = 2,
-  ntree_moderate = 50,
-  base_moderate  = 0.25,
-  power_moderate = 3
+  ntree_control  = 200,   # mu: 200 trees
+  base_control   = 0.95,  # mu: eta = 0.95
+  power_control  = 2,     # mu: beta = 2
+  ntree_moderate = 50,    # tau (primary): 50 trees
+  base_moderate  = 0.25,  # tau (primary): eta = 0.25
+  power_moderate = 3      # tau (primary): beta = 3
 )
 
 sensitivity_pars <- list(
-  ntree_control  = 200,
-  base_control   = 0.95,
-  power_control  = 2,
-  ntree_moderate = 200,
-  base_moderate  = 0.95,
-  power_moderate = 2
+  ntree_control  = 200,   # mu: 200 trees (unchanged)
+  base_control   = 0.95,  # mu: eta = 0.95 (unchanged)
+  power_control  = 2,     # mu: beta = 2 (unchanged)
+  ntree_moderate = 200,   # tau (sensitivity): same as mu -> 200 trees
+  base_moderate  = 0.95,  # tau (sensitivity): same as mu -> eta = 0.95
+  power_moderate = 2      # tau (sensitivity): same as mu -> beta = 2
 )
 
 #############################
-# 9. BCF Fit Function
+# 10. BCF fit function
 #############################
 
 fit_bcf <- function(data,
                     outcome_var,
+                    treat_var,
+                    covars,
                     pars,
-                    nburn = 2000,
-                    nsim  = 5000) {
+                    pihat_fixed,
+                    nburn = 100,
+                    nsim  = 500) {
   
   y <- as.numeric(data[[outcome_var]])
-  z <- as.numeric(data$z)
+  z <- as.numeric(data[[treat_var]])
   
   X <- data[, covars, drop = FALSE] %>%
     mutate(across(where(is.factor),  as.numeric),
            across(where(is.logical), as.numeric)) %>%
     as.matrix()
   
-  # BUG FIX: complete.cases needs a single data-frame, not separate objects
   keep <- complete.cases(data.frame(y = y, z = z, X))
   
   y <- y[keep]
@@ -188,11 +369,74 @@ fit_bcf <- function(data,
   cat("\n--- Diagnostics ---\n")
   cat("Outcome:", outcome_var, "\n")
   cat("N:", length(y), "\n")
-  cat("Treated:", sum(z == 1), "\n")
-  cat("Control:", sum(z == 0), "\n")
+  cat("Treated (C-LIFE):", sum(z == 1), "\n")
+  cat("Control (SEPA):",   sum(z == 0), "\n")
   
-  # Randomised trial → use empirical treatment probability
-  pihat <- rep(mean(z), length(z))
+  #############################
+  # Pre-flight checks before handing data to the bcf C++ backend.
+  # "drmu failed" / "task N failed" errors from bcf are almost always
+  # caused by malformed numeric input reaching the sampler -- NA/Inf
+  # values that slipped past complete.cases(), zero-variance columns,
+  # or near-collinear covariates causing a singular matrix in the
+  # internal tree/leaf updates. These checks catch the problem in R,
+  # with a readable message, before it reaches the opaque C++ error.
+  #############################
+  
+  if (any(!is.finite(y))) {
+    stop(sprintf("y contains non-finite values (NA/Inf/NaN) after complete.cases() -- %d bad entries", sum(!is.finite(y))))
+  }
+  
+  if (any(!is.finite(z))) {
+    stop("z contains non-finite values (NA/Inf/NaN) after complete.cases()")
+  }
+  
+  if (any(!is.finite(X))) {
+    bad_cols <- colnames(X)[apply(X, 2, function(col) any(!is.finite(col)))]
+    stop(sprintf("X contains non-finite values (NA/Inf/NaN) in columns: %s", paste(bad_cols, collapse = ", ")))
+  }
+  
+  #############################
+  # BUG FIX (root cause of "Imputation N FAILED: X has zero-variance
+  # columns" killing entire imputations): a covariate can be
+  # non-constant in the raw data (it already passed the
+  # raw_constant_covars filter in step 7b) and STILL come out constant
+  # in this ONE particular imputed dataset, purely because mice()
+  # happened to fill every missing value with the same dominant
+  # category in this draw. That's an artifact of this one imputation,
+  # not a real data problem, so it shouldn't abort the whole model fit.
+  #
+  # FIX: drop just the offending column(s) from THIS dataset's X and
+  # continue, recording what was dropped. This is safe for pooling:
+  # pool_tau() pools posterior draws by SUBJECT (columns of the tau
+  # matrix), not by covariate, and `keep` above is computed before any
+  # covariates are dropped, so the same subjects are retained
+  # regardless of which covariates end up in X for this particular fit.
+  #############################
+  
+  zero_var_cols <- colnames(X)[apply(X, 2, function(col) sd(col, na.rm = TRUE) == 0)]
+  dropped_covars <- character(0)
+  
+  if (length(zero_var_cols) > 0) {
+    dropped_covars <- zero_var_cols
+    cat(sprintf(
+      "\nNOTE: %d covariate(s) are constant in THIS imputed dataset and will be dropped from this fit only (likely a dominant-category artifact of this imputation draw, not the raw data): %s\n",
+      length(zero_var_cols), paste(zero_var_cols, collapse = ", ")
+    ))
+    X <- X[, !colnames(X) %in% zero_var_cols, drop = FALSE]
+  }
+  
+  if (ncol(X) == 0) {
+    stop("After dropping zero-variance columns, X has no covariates left for this imputation -- cannot fit bcf().")
+  }
+  
+  if (nrow(X) < ncol(X)) {
+    stop(sprintf("X has more covariates (%d) than observations (%d) -- bcf cannot fit a stable model with p > n", ncol(X), nrow(X)))
+  }
+  
+  cat("All pre-flight checks passed. y range: [", min(y), ",", max(y), "], X dims:", nrow(X), "x", ncol(X), "\n")
+  
+  # Fixed propensity score per 2:1 randomization design (SAP section 2)
+  pihat <- rep(pihat_fixed, length(z))
   
   fit <- bcf(
     y              = y,
@@ -210,202 +454,259 @@ fit_bcf <- function(data,
     power_moderate = pars$power_moderate
   )
   
+  # Record what (if anything) was dropped for this fit, so it can be
+  # reported/audited later without needing to re-derive it.
+  attr(fit, "dropped_covariates") <- dropped_covars
+  attr(fit, "n_subjects_used")    <- length(y)
+  
   return(fit)
 }
 
+
 #############################
-# 10. Run Across Imputations
+# 11. Run BCF across all 5 imputed datasets
+#
+# The tryCatch below uses message() (not print()) for error detail,
+# since message() reliably writes to stderr and shows up in the R
+# console regardless of context, and each failure is tagged with
+# which imputation (1-5) it came from.
 #############################
 
-fit_all_imputations <- function(outcome_var, pars) {
-  
-  models <- lapply(imp_list, function(dat) {
+fit_all_imputations <- function(pars, pars_label = "", nburn = 100, nsim = 500) {
+  models <- lapply(seq_along(imp_list), function(i) {
     tryCatch(
-      fit_bcf(data = dat, outcome_var = outcome_var, pars = pars),
-      error = function(e) { print(e); return(NULL) }
+      fit_bcf(
+        data        = imp_list[[i]],
+        outcome_var = outcome_var,
+        treat_var   = treat_var,
+        covars      = covars,
+        pars        = pars,
+        pihat_fixed = pihat_fixed,
+        nburn       = nburn,
+        nsim        = nsim
+      ),
+      error = function(e) {
+        message(sprintf("[%s] Imputation %d FAILED: %s", pars_label, i, conditionMessage(e)))
+        return(NULL)
+      }
     )
   })
-  
   Filter(Negate(is.null), models)
 }
 
-#############################
-# 11. Primary Analysis
-#############################
+# Primary analysis (skeptical tau prior)
+bcf_primary_models <- fit_all_imputations(primary_pars, pars_label = "primary")
+cat("\nPrimary analysis -- successful model fits:", length(bcf_primary_models), "\n")
 
-bcf_exec_models <- fit_all_imputations(
-  outcome_var = "exec_change",
-  pars        = primary_pars
-)
-
-cat("\nSuccessful models:", length(bcf_exec_models), "\n")
-
-#############################
-# 12. Extract Posterior Tau
-#############################
-
-# BUG FIX: BCF stores individual treatment effect draws in $tauhats,
-#           not $tau. Rows = posterior draws, cols = subjects.
-
-extract_tau <- function(fit) {
-  if (is.null(fit))             return(NULL)
-  if (is.null(fit$tauhats))     stop("tauhats not found in BCF object")
-  as.matrix(fit$tauhats)
+# Stop here with a clear message if NOTHING fit, rather than letting
+# the failure surface later as a cryptic pooling error
+if (length(bcf_primary_models) == 0) {
+  stop("All primary BCF fits failed -- see [primary] Imputation N FAILED messages above for the actual cause before proceeding.")
 }
 
-tau_list   <- lapply(bcf_exec_models, extract_tau)
-tau_list   <- Filter(Negate(is.null), tau_list)
-lapply(tau_list, dim)          # sanity check dimensions
+cat("\nCovariates dropped per imputation (primary analysis -- zero variance in that draw only, for the audit trail):\n")
+print(lapply(bcf_primary_models, function(f) attr(f, "dropped_covariates")))
 
-# Pool posterior draws across imputations
-pooled_tau <- do.call(rbind, tau_list)
-cat("\nPooled tau dims:", dim(pooled_tau), "\n")
+# Sensitivity analysis (tau prior matches mu prior)
+#bcf_sensitivity_models <- fit_all_imputations(sensitivity_pars, pars_label = "sensitivity")
+#cat("\nSensitivity analysis -- successful model fits:", length(bcf_sensitivity_models), "\n")
+
+#if (length(bcf_sensitivity_models) == 0) {
+#  stop("All sensitivity BCF fits failed -- see [sensitivity] Imputation N FAILED messages above for the actual cause before proceeding.")
+# }
+
+#cat("\nCovariates dropped per imputation (sensitivity analysis -- zero variance in that draw only, for the audit trail):\n")
+#print(lapply(bcf_sensitivity_models, function(f) attr(f, "dropped_covariates")))
+
 
 #############################
-# 13. Overall ATE
+# 12. Extract and pool posterior tau draws across imputations
+#
+# Per SAP: fit BCF on all 5 imputed datasets separately, extract
+# posterior draws from each, and pool ("mix") the draws into one
+# final posterior distribution (Zhou & Reiter, 2010).
 #############################
 
-ate_draws   <- rowMeans(pooled_tau)
+extract_tau <- function(fit) {
+  if (is.null(fit))         return(NULL)
+  if (is.null(fit$tau))     stop("tau not found in BCF model object -- check names(fit) for the correct field name in your installed bcf package version")
+  as.matrix(fit$tau)
+}
+
+pool_tau <- function(models, label = "") {
+  
+  if (length(models) == 0) {
+    stop(sprintf("pool_tau() called on an empty model list (%s) -- nothing to pool. Check fit_all_imputations() output above.", label))
+  }
+  
+  tau_list <- lapply(models, extract_tau)
+  tau_list <- Filter(Negate(is.null), tau_list)
+  
+  if (length(tau_list) == 0) {
+    stop(sprintf("All models in '%s' returned NULL tau -- inspect extract_tau() and the bcf object structure.", label))
+  }
+  
+  # Check all matrices have the same number of columns (subjects)
+  # before rbind -- mismatched N across imputations is a common
+  # silent cause of "subscript out of bounds"
+  ncols <- sapply(tau_list, ncol)
+  if (length(unique(ncols)) > 1) {
+    cat("\nColumn counts per imputation (should all match):\n")
+    print(ncols)
+    stop(sprintf("Tau matrices in '%s' have different numbers of columns across imputations -- likely caused by complete.cases() dropping a different number of rows in each imputed dataset. Cannot rbind.", label))
+  }
+  
+  do.call(rbind, tau_list)
+}
+
+pooled_tau_primary     <- pool_tau(bcf_primary_models, label = "primary")
+# pooled_tau_sensitivity <- pool_tau(bcf_sensitivity_models, label = "sensitivity")
+
+cat("\nPooled tau (primary) dims:", dim(pooled_tau_primary), "\n")
+# cat("Pooled tau (sensitivity) dims:", dim(pooled_tau_sensitivity), "\n")
+
+#############################
+# 13. Overall ATE (primary analysis)
+#############################
+
+ate_draws   <- rowMeans(pooled_tau_primary)
 overall_ate <- mean(ate_draws)
 ate_ci      <- quantile(ate_draws, probs = c(0.025, 0.975))
 p_gt_zero   <- mean(ate_draws > 0)
 
-cat("\nOverall ATE:", overall_ate, "\n")
+cat("\nOverall ATE (primary):", overall_ate, "\n")
 cat("95% Credible Interval:\n"); print(ate_ci)
 cat("P(ATE > 0):", p_gt_zero, "\n")
 
 #############################
-# 14. Subject-level CATE
+# 14. Subject-level CATE (primary analysis)
 #############################
 
-cate        <- colMeans(pooled_tau)
+cate        <- colMeans(pooled_tau_primary)
 analysis_df <- imp_list[[1]]
 analysis_df$cate <- cate
 
 #############################
-# 15. Subgroup Effect Function
+# 15. Subgroup contrast function
+#
+# Per SAP: report mean and 95% credible interval of tau1 - tau2,
+# plus Pr(tau1 - tau2 > 0), using the FULL pooled posterior draws.
 #############################
 
-subgroup_effect <- function(idx_list, label1, label2) {
-  
-  idx1 <- idx_list[[1]]
-  idx2 <- idx_list[[2]]
+subgroup_effect <- function(idx1, idx2, label1, label2, tau_matrix = pooled_tau_primary) {
   
   if (length(idx1) == 0 || length(idx2) == 0)
-    stop("Empty subgroup — check variable coding.")
+    stop("Empty subgroup -- check variable coding.")
   
-  g1   <- rowMeans(pooled_tau[, idx1, drop = FALSE])
-  g2   <- rowMeans(pooled_tau[, idx2, drop = FALSE])
+  g1   <- rowMeans(tau_matrix[, idx1, drop = FALSE])
+  g2   <- rowMeans(tau_matrix[, idx2, drop = FALSE])
   diff <- g1 - g2
   
   tibble(
-    group1  = label1,
-    group2  = label2,
-    mean    = mean(diff),
-    lo      = quantile(diff, 0.025),
-    hi      = quantile(diff, 0.975),
-    p_gt_0  = mean(diff > 0)
+    group1 = label1,
+    group2 = label2,
+    mean   = mean(diff),
+    lo     = quantile(diff, 0.025),
+    hi     = quantile(diff, 0.975),
+    p_gt_0 = mean(diff > 0)
   )
 }
 
 #############################
-# 16. Pre-specified Subgroups
-#
-# BUG FIX: original second-draft used analysis_df$sex and
-#           analysis_df$age (lowercase), which don't exist.
-#           Actual columns are male.x (0/1) and Age (capital A).
+# 16. Pre-specified subgroups per SAP:
+#       male vs. female
+#       < 60 years vs. >= 60 years
 #############################
 
-# Sex
 sex_idx <- list(
-  male   = which(analysis_df$male.x == 1),
-  female = which(analysis_df$male.x == 0)
+  male   = which(analysis_df$male == 1),
+  female = which(analysis_df$male == 0)
 )
 
-sex_results <- subgroup_effect(sex_idx, "Male", "Female")
+sex_results <- subgroup_effect(
+  sex_idx$male, sex_idx$female,
+  "Male", "Female"
+)
 print(sex_results)
 
-# Age
 age_idx <- list(
   lt60 = which(analysis_df$Age <  60),
   ge60 = which(analysis_df$Age >= 60)
 )
 
-age_results <- subgroup_effect(age_idx, "<60", ">=60")
+age_results <- subgroup_effect(
+  age_idx$lt60, age_idx$ge60,
+  "<60", ">=60"
+)
 print(age_results)
 
 #############################
-# 17. Density Plot (target output)
+# 17. Density plot -- pre-specified subgroup (Figure 1 style)
 #
-# Two-panel figure matching the screenshot:
-#   Left:  overlapping densities for each subgroup's ATE
-#   Right: density of the between-group difference
+# Matches the SAP's "Figure 1" mock: left panel shows overlapping
+# subgroup posterior densities, right panel shows their difference.
 #############################
 
-# --- Posterior draws per subgroup ---
-male_draws   <- rowMeans(pooled_tau[, sex_idx$male,   drop = FALSE])
-female_draws <- rowMeans(pooled_tau[, sex_idx$female, drop = FALSE])
+male_draws   <- rowMeans(pooled_tau_primary[, sex_idx$male,   drop = FALSE])
+female_draws <- rowMeans(pooled_tau_primary[, sex_idx$female, drop = FALSE])
 diff_draws   <- male_draws - female_draws
 
-# --- Panel A: overlapping subgroup densities ---
-plot_df <- tibble(
-  `Men`   = male_draws,
-  `Women` = female_draws
-) %>%
-  pivot_longer(
-    cols      = everything(),
-    names_to  = "group",
-    values_to = "value"
-  )
+plot_df <- tibble(Male = male_draws, Female = female_draws) %>%
+  pivot_longer(everything(), names_to = "group", values_to = "value")
 
 p_dens <- ggplot(plot_df, aes(x = value, fill = group)) +
   geom_density(alpha = 0.4) +
-  labs(
-    x    = "Subgroup treatment effect",
-    y    = "Posterior density",
-    fill = "Group"
-  ) +
+  labs(x = "Subgroup treatment effect", y = "Posterior density", fill = "Group") +
   theme_bw() +
   theme(legend.position = "bottom")
 
-# --- Panel B: difference density ---
 diff_df <- tibble(value = diff_draws)
 
 p_diff <- ggplot(diff_df, aes(x = value)) +
   geom_density(fill = "grey60", alpha = 0.5) +
   geom_vline(xintercept = 0, linetype = "dashed") +
-  labs(
-    x = "Difference",
-    y = "Density"
-  ) +
+  labs(x = "Difference", y = "Density") +
   theme_bw()
 
-# --- Combined plot (requires patchwork; falls back to side-by-side base) ---
-if (!requireNamespace("patchwork", quietly = TRUE)) {
-  install.packages("patchwork")
-}
-library(patchwork)
-
+if (!requireNamespace("patchwork", quietly = TRUE)) install.packages("patchwork")
 library(patchwork)
 
 combined_plot <- p_dens + p_diff +
-  plot_annotation(
-    caption = "Left: posterior ATE by subgroup. Right: posterior difference (Male − Female)."
-  )
+  plot_annotation(caption = "Left: posterior ATE by subgroup (male vs. female). Right: posterior difference (Male - Female).")
 
+ggsave("density_plot_sex.png", combined_plot, width = 10, height = 5, dpi = 150)
 dev.new(); print(combined_plot)
-dev.new(); rpart.plot(cart_fit, type = 3, extra = 101)
-
-print(combined_plot)
-
 
 #############################
-# 18. CART Subgroup Discovery
+# 18. CART-based subgroup discovery
 #############################
 
-cart_formula <- as.formula(
-  paste("cate ~", paste(covars, collapse = " + "))
+# Restrict CART to baseline covariates only (per SAP)
+# intersect() guards against any name mismatches between this list
+# and what's actually in analysis_df (e.g. case differences, merge suffixes)
+baseline_vars <- c(
+  "speedt1r", "memt1r", "pjexect1r", "age", "clinicdbpt1",
+  "clinicsbpt1", "avgstepst1", "pkvo2t1", "eduyrs", "totChol",
+  "trigly", "HDL", "LDL", "VLDL", "Glucose", "Insulin",
+  "Creatinine", "HbA1C", "adbasT1", "fmdt1", "fart1",
+  "MeanSys24hrT", "MeanDia24hrT", "Bpdddt1", "Diabdddt1",
+  "Dashdt1", "Male", "Wthrt1", "Metsynst1", "Framenoaget1", "crpt1r"
 )
+
+cart_baseline_covars <- intersect(baseline_vars, names(analysis_df))
+
+# Warn if any expected baseline variables are missing from the dataset
+missing_baseline <- setdiff(baseline_vars, names(analysis_df))
+if (length(missing_baseline) > 0) {
+  cat("\nWARNING: these baseline variables are not in analysis_df and will be excluded from CART:\n")
+  print(missing_baseline)
+}
+
+cat("\nBaseline covariates entering CART:", length(cart_baseline_covars), "\n")
+print(cart_baseline_covars)
+
+# Use baseline_covars for CART formula (not the full covars list)
+cart_formula <- as.formula(paste("cate ~", paste(cart_baseline_covars, collapse = " + ")))
 
 cart_fit <- rpart(
   cart_formula,
@@ -414,20 +715,24 @@ cart_fit <- rpart(
   control = rpart.control(cp = 0.01, minbucket = 20, maxdepth = 3)
 )
 
+#############################
+
+png("cart_tree.png", width = 800, height = 600)
 rpart.plot(cart_fit, type = 3, extra = 101)
+dev.off()
+
+dev.new(); rpart.plot(cart_fit, type = 3, extra = 101)
 
 #############################
-# 19. Terminal Node Effects
+# 19. Terminal node effects (data-driven subgroups)
 #############################
 
 nodes            <- cart_fit$where
 analysis_df$node <- nodes
 
 node_results <- lapply(unique(nodes), function(n) {
-  
   idx  <- which(nodes == n)
-  draw <- rowMeans(pooled_tau[, idx, drop = FALSE])
-  
+  draw <- rowMeans(pooled_tau_primary[, idx, drop = FALSE])
   tibble(
     node   = n,
     mean   = mean(draw),
@@ -435,63 +740,74 @@ node_results <- lapply(unique(nodes), function(n) {
     hi     = quantile(draw, 0.975),
     p_gt_0 = mean(draw > 0)
   )
-  
 }) %>% bind_rows()
 
 print(node_results)
 
 #############################
-# 20. Summary Table
-#    (matches mock table in screenshot)
+# 20. Summary table (matches SAP mock table)
 #############################
 
 summary_table <- bind_rows(
   tibble(
-    subgroup1  = "Overall",
-    subgroup2  = "—",
-    ate        = overall_ate,
-    ci_lo      = ate_ci[[1]],
-    ci_hi      = ate_ci[[2]],
-    p_gt_zero  = p_gt_zero
+    subgroup1 = "Overall", subgroup2 = "-",
+    ate = overall_ate, ci_lo = ate_ci[[1]], ci_hi = ate_ci[[2]],
+    p_gt_zero = p_gt_zero
   ),
   sex_results %>% transmute(
-    subgroup1 = group1,
-    subgroup2 = group2,
-    ate       = mean,
-    ci_lo     = lo,
-    ci_hi     = hi,
-    p_gt_zero = p_gt_0
+    subgroup1 = group1, subgroup2 = group2,
+    ate = mean, ci_lo = lo, ci_hi = hi, p_gt_zero = p_gt_0
   ),
   age_results %>% transmute(
-    subgroup1 = group1,
-    subgroup2 = group2,
-    ate       = mean,
-    ci_lo     = lo,
-    ci_hi     = hi,
-    p_gt_zero = p_gt_0
+    subgroup1 = group1, subgroup2 = group2,
+    ate = mean, ci_lo = lo, ci_hi = hi, p_gt_zero = p_gt_0
   )
 ) %>%
   mutate(
-    `Posterior Mean ATE (95% CI)` = sprintf(
-      "%.2f (%.2f, %.2f)", ate, ci_lo, ci_hi
-    ),
-    `Pr(τ₁ − τ₂ > 0)` = round(p_gt_zero, 2)
+    `Posterior Mean ATE (95% CI)` = sprintf("%.2f (%.2f, %.2f)", ate, ci_lo, ci_hi),
+    `Pr(tau1 - tau2 > 0)`         = round(p_gt_zero, 2)
   ) %>%
   select(
-    `Subgroup 1`             = subgroup1,
-    `Subgroup 2`             = subgroup2,
+    `Subgroup 1` = subgroup1,
+    `Subgroup 2` = subgroup2,
     `Posterior Mean ATE (95% CI)`,
-    `Pr(τ₁ − τ₂ > 0)`
+    `Pr(tau1 - tau2 > 0)`
   )
 
 print(summary_table)
 
 #############################
-# 21. Save Results
+# 21. Save all results
 #############################
 
-write.csv(node_results,  "subgroup_results.csv",   row.names = FALSE)
-write.csv(summary_table, "summary_table.csv",       row.names = FALSE)
+write.csv(node_results,    "subgroup_results_cart.csv", row.names = FALSE)
+write.csv(summary_table,   "summary_table.csv",         row.names = FALSE)
 
-saveRDS(bcf_exec_models, "bcf_exec_models.rds")
-saveRDS(pooled_tau,      "pooled_tau.rds")
+saveRDS(bcf_primary_models,     "bcf_primary_models.rds")
+saveRDS(bcf_sensitivity_models, "bcf_sensitivity_models.rds")
+saveRDS(pooled_tau_primary,     "pooled_tau_primary.rds")
+# saveRDS(pooled_tau_sensitivity, "pooled_tau_sensitivity.rds")
+
+
+## imp1<-imp_list[[1]]
+
+#fit_all_imputations2<-function(outcome_var, pars) {
+# 
+#  models <- 
+#  tryCatch(
+# fit_bcf(data = imp1, outcome_var = outcome_var, pars = pars, nburn=20,nsim=100),
+#  error = function(e) { print(e); return(NULL) }
+#)
+#
+# Filter(Negate(is.null), models)
+#}
+#
+#
+#bcf_exec_models2 <- fit_all_imputations2(
+#  outcome_var = "exec_change",
+#  pars        = primary_pars
+#)
+
+#class(bcf_exec_models2[[1]])
+
+#####

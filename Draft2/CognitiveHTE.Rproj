@@ -1,46 +1,6 @@
 ############################################################
 # Bayesian Causal Forest (BCF) Pipeline -- REVISED
 ############################################################
-#
-# REVISION SUMMARY (what changed and why):
-#
-# 1. ROOT CAUSE OF "Imputation N FAILED: X has zero-variance columns":
-#    fit_bcf() used to call stop() the moment ANY covariate came out
-#    constant in a given imputed dataset, killing that entire
-#    imputation. But a covariate can have real variation in the raw
-#    data (and pass the step-7b raw-data check) and still happen to
-#    come out constant in ONE imputed draw, purely because mice()
-#    filled every missing value with the same dominant category that
-#    time. That's an artifact of a single imputation draw, not a real
-#    data problem, and shouldn't sink the whole model fit.
-#    FIX: fit_bcf() now drops just the offending column(s) from that
-#    one fit and continues, recording what was dropped. This is safe
-#    for pooling because pool_tau() pools posterior draws by SUBJECT
-#    (columns of the tau matrix), not by covariate -- a slightly
-#    different covariate set per imputation doesn't break the rbind,
-#    as long as the same subjects (rows) are retained, which they are.
-#
-# 2. DEAD / BROKEN CODE in step 4: `X[, names(X) != "Raceoth"]` and
-#    `dat$Raceoth <- NULL` referenced objects (X, dat) that don't
-#    exist at that point in the script -- this would throw
-#    "object 'X' not found". Replaced with a safe removal from `df`.
-#
-# 3. UNDEFINED VARIABLE bug in step 8: `pihat <- rep(mean(z), length(z))`
-#    referenced a global `z` that never exists (z only lives inside
-#    each imputed dataset, created in step 6). Downstream, step 11
-#    called fit_bcf(..., pihat_fixed = pihat_fixed) but `pihat_fixed`
-#    was never defined anywhere. Per the SAP, pihat is a fixed
-#    constant (2/3) by design (2:1 randomization), so it's now defined
-#    directly as that constant -- no dependency on any global z.
-#
-# 4. Defensive column drops in step 4 now use dplyr::any_of() instead
-#    of bare column names, so the script won't hard-crash if a column
-#    name differs slightly from what's expected.
-#
-# 5. Removed leftover commented-out scratch/debug code that was at
-#    the bottom of the original file.
-#
-############################################################
 
 #############################
 # 1. Packages
@@ -51,6 +11,7 @@ pkgs <- c(
   "rpart", "rpart.plot", "posterior",
   "tidyr", "readxl", "tibble", "stringr", "data.table"
 )
+
 
 to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
 
@@ -226,7 +187,7 @@ treat_var   <- "z"
 imp_list <- lapply(imp_list, function(dat) {
   dat %>%
     mutate(
-      exec_change = pjexect2r - pjexect1r,
+      exec_change = pjexect2r,
       z           = ifelse(group == "C-LIFE", 1L, 0L)
     )
 })
@@ -388,8 +349,8 @@ fit_bcf <- function(data,
                     covars,
                     pars,
                     pihat_fixed,
-                    nburn = 500,
-                    nsim  = 1000) {
+                    nburn = 100,
+                    nsim  = 500) {
   
   y <- as.numeric(data[[outcome_var]])
   z <- as.numeric(data[[treat_var]])
@@ -511,7 +472,7 @@ fit_bcf <- function(data,
 # which imputation (1-5) it came from.
 #############################
 
-fit_all_imputations <- function(pars, pars_label = "") {
+fit_all_imputations <- function(pars, pars_label = "", nburn = 100, nsim = 500) {
   models <- lapply(seq_along(imp_list), function(i) {
     tryCatch(
       fit_bcf(
@@ -520,7 +481,9 @@ fit_all_imputations <- function(pars, pars_label = "") {
         treat_var   = treat_var,
         covars      = covars,
         pars        = pars,
-        pihat_fixed = pihat_fixed
+        pihat_fixed = pihat_fixed,
+        nburn       = nburn,
+        nsim        = nsim
       ),
       error = function(e) {
         message(sprintf("[%s] Imputation %d FAILED: %s", pars_label, i, conditionMessage(e)))
@@ -545,15 +508,15 @@ cat("\nCovariates dropped per imputation (primary analysis -- zero variance in t
 print(lapply(bcf_primary_models, function(f) attr(f, "dropped_covariates")))
 
 # Sensitivity analysis (tau prior matches mu prior)
-bcf_sensitivity_models <- fit_all_imputations(sensitivity_pars, pars_label = "sensitivity")
-cat("\nSensitivity analysis -- successful model fits:", length(bcf_sensitivity_models), "\n")
+#bcf_sensitivity_models <- fit_all_imputations(sensitivity_pars, pars_label = "sensitivity")
+#cat("\nSensitivity analysis -- successful model fits:", length(bcf_sensitivity_models), "\n")
 
-if (length(bcf_sensitivity_models) == 0) {
-  stop("All sensitivity BCF fits failed -- see [sensitivity] Imputation N FAILED messages above for the actual cause before proceeding.")
-}
+#if (length(bcf_sensitivity_models) == 0) {
+#  stop("All sensitivity BCF fits failed -- see [sensitivity] Imputation N FAILED messages above for the actual cause before proceeding.")
+# }
 
-cat("\nCovariates dropped per imputation (sensitivity analysis -- zero variance in that draw only, for the audit trail):\n")
-print(lapply(bcf_sensitivity_models, function(f) attr(f, "dropped_covariates")))
+#cat("\nCovariates dropped per imputation (sensitivity analysis -- zero variance in that draw only, for the audit trail):\n")
+#print(lapply(bcf_sensitivity_models, function(f) attr(f, "dropped_covariates")))
 
 
 #############################
@@ -597,10 +560,10 @@ pool_tau <- function(models, label = "") {
 }
 
 pooled_tau_primary     <- pool_tau(bcf_primary_models, label = "primary")
-pooled_tau_sensitivity <- pool_tau(bcf_sensitivity_models, label = "sensitivity")
+# pooled_tau_sensitivity <- pool_tau(bcf_sensitivity_models, label = "sensitivity")
 
 cat("\nPooled tau (primary) dims:", dim(pooled_tau_primary), "\n")
-cat("Pooled tau (sensitivity) dims:", dim(pooled_tau_sensitivity), "\n")
+# cat("Pooled tau (sensitivity) dims:", dim(pooled_tau_sensitivity), "\n")
 
 #############################
 # 13. Overall ATE (primary analysis)
@@ -716,13 +679,34 @@ dev.new(); print(combined_plot)
 
 #############################
 # 18. CART-based subgroup discovery
-#
-# Per SAP: fit a parsimonious regression tree (rpart) to posterior
-# point estimates of unit-level treatment effects, using all
-# covariates as predictors, to propose data-driven subgroups.
 #############################
 
-cart_formula <- as.formula(paste("cate ~", paste(covars, collapse = " + ")))
+# Restrict CART to baseline covariates only (per SAP)
+# intersect() guards against any name mismatches between this list
+# and what's actually in analysis_df (e.g. case differences, merge suffixes)
+baseline_vars <- c(
+  "speedt1r", "memt1r", "pjexect1r", "age", "clinicdbpt1",
+  "clinicsbpt1", "avgstepst1", "pkvo2t1", "eduyrs", "totChol",
+  "trigly", "HDL", "LDL", "VLDL", "Glucose", "Insulin",
+  "Creatinine", "HbA1C", "adbasT1", "fmdt1", "fart1",
+  "MeanSys24hrT", "MeanDia24hrT", "Bpdddt1", "Diabdddt1",
+  "Dashdt1", "Male", "Wthrt1", "Metsynst1", "Framenoaget1", "crpt1r"
+)
+
+cart_baseline_covars <- intersect(baseline_vars, names(analysis_df))
+
+# Warn if any expected baseline variables are missing from the dataset
+missing_baseline <- setdiff(baseline_vars, names(analysis_df))
+if (length(missing_baseline) > 0) {
+  cat("\nWARNING: these baseline variables are not in analysis_df and will be excluded from CART:\n")
+  print(missing_baseline)
+}
+
+cat("\nBaseline covariates entering CART:", length(cart_baseline_covars), "\n")
+print(cart_baseline_covars)
+
+# Use baseline_covars for CART formula (not the full covars list)
+cart_formula <- as.formula(paste("cate ~", paste(cart_baseline_covars, collapse = " + ")))
 
 cart_fit <- rpart(
   cart_formula,
@@ -730,6 +714,8 @@ cart_fit <- rpart(
   method  = "anova",
   control = rpart.control(cp = 0.01, minbucket = 20, maxdepth = 3)
 )
+
+#############################
 
 png("cart_tree.png", width = 800, height = 600)
 rpart.plot(cart_fit, type = 3, extra = 101)
@@ -800,7 +786,7 @@ write.csv(summary_table,   "summary_table.csv",         row.names = FALSE)
 saveRDS(bcf_primary_models,     "bcf_primary_models.rds")
 saveRDS(bcf_sensitivity_models, "bcf_sensitivity_models.rds")
 saveRDS(pooled_tau_primary,     "pooled_tau_primary.rds")
-saveRDS(pooled_tau_sensitivity, "pooled_tau_sensitivity.rds")
+# saveRDS(pooled_tau_sensitivity, "pooled_tau_sensitivity.rds")
 
 
 ## imp1<-imp_list[[1]]
