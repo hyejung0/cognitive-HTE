@@ -1,0 +1,587 @@
+---
+title: "Quality Check"
+# subtitle: "version 1"
+author: "Hyejung Lee <hyejung.lee@utah.edu>"
+date: "`r format(Sys.time(), '%a %b %d, %Y %X')`"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    toc: true
+    theme: united
+    number-sections: true
+bibliography: references.bib
+csl: nature.csl
+editor_options: 
+  chunk_output_type: console
+  markdown: 
+    wrap: 72
+---
+
+```{r}
+#| include: false
+#| message: false
+#| warning: false
+
+# knitr::opts_knit\$set(root.dir = "./SAP") 
+# remotes::install_github('yihui/knitr') 
+library(knitr) 
+library(ggplot2)
+library(bcf) 
+library(rpart) 
+library(rpart.plot) 
+library(data.table)
+library(coda) 
+library(gt) 
+library(mice)
+library(gt)
+
+knitr::opts_chunk$set(echo = FALSE)
+
+ncores<-strtoi(Sys.getenv("SLURM_NTASKS")) #Pick up -ntasks or --n from the environment
+
+
+
+#Read in Data and data dictionary
+cleanDat<-readRDS("../Data/cleanDat.rds")
+#Data dictionary
+data_dictionary<-readxl::read_excel("../Data/Nikki Smith R01 Subset.xls",
+                                    sheet=2,
+                                    col_names=TRUE,
+                                    na=c("","."))
+data_dictionary<-data.table(data_dictionary)
+data_dictionary<-data_dictionary[stringr::str_detect(SUBID,"diff", negate = T),]
+
+```
+
+
+# Table 1 
+
+```{r}
+#| label: tbl-table1
+#| echo: false
+#| eval: true
+#| message: false
+#| tbl-cap: "Summary distributions of all variables grouped by the treatment. The standardized mean difference (SMD) is also reported to assess the balance of covariates between the two treatment groups. For any variables with missing, pairwise complete cases are used to calculate the SMD. An SMD less than 0.1 is generally considered indicative of good balance. The variables are ordered by the magnitude of SMD, with the largest SMDs appearing first."
+
+source("../function/nice_SMD_table1_v2.R")
+
+
+
+# Identify Covariates
+covar<-copy(data_dictionary)
+#Exclude the outcome variable, treatment variable, and ID
+covar<-
+  covar[!SUBID %in%c("SUBID",
+                     # "speedt2r",
+                     # "memt2r",
+                     # "pjexect2r",
+                     "group")]
+colnames_to_print_original<-covar$SUBID
+colnames_to_print<-covar$`Subject identifier`
+names(colnames_to_print)<-colnames_to_print_original
+
+my_covariates<-cleanDat[,..colnames_to_print_original]
+my_group<-cleanDat$group
+
+saved_out<-nice_SMD_table1_v2(
+  dat=my_covariates,
+  group=my_group,
+  covar_names = colnames_to_print_original,
+  print_covariate_names=colnames_to_print,
+  group_for_SMD = unique(my_group),
+  contDigits = 2,
+  catDigits=3,
+  sort_by_smd = T
+)
+
+#Change the table 1 column names
+setnames(saved_out,"this.rownames","Variables")
+setnames(saved_out,"SMD (SEPA vs. C-LIFE)","SMD")
+
+# #Identify variables with SMD > 0.1
+# numeric_smd<-saved_out[,as.numeric(SMD)]
+# smd.index<-which(numeric_smd>0.1)
+# smd_0.1_tab<-saved_out[smd.index, .(Variables,SMD)]
+# smd_0.1_tab[,SMD:=as.numeric(SMD)]
+# smd_0.1_tab<-smd_0.1_tab[order(SMD,decreasing = T),]
+# smd_0.1_vars<-saved_out[smd.index, Variables]
+# 
+
+#print out table 1
+kable(saved_out)
+
+```
+
+@tbl-table1 shows the summary distributions of all variables grouped by the treatment. The standardized mean difference (SMD) is also reported to assess the balance of covariates between the two treatment groups. An SMD less than 0.1 is generally considered indicative of good balance. As we can see, many of the baseline variables'SMD exceed 0.1. This is not due to any confounding as the patients were randomized. Thus, what we see is chance imbalance. Take a look, for example, aerobic fitness at baseline. Even though the SMD is near 0.5, the mean and median between SEPA and C-LIFE are very similar. Thus, the high SMD value is due to highly skewed distribution of the variable (SMD is sensitive to skewness). @fig-baseline-aerobic shows the density plot of aerobic fitness at baseline by treatment group. As we can see, the distribution is highly skewed and the mean and median are very similar between the two groups.
+
+
+```{r}
+#| label: fig-baseline-aerobic
+#| echo: false
+#| eval: true
+#| message: false
+#| fig-cap: "Density plot of aerobic fitness at baseline by treatment group."
+
+
+index<-which(colnames_to_print=="Aerobic Fitness at baseline")
+aerobic_fit<-colnames_to_print_original[index]
+ggplot(cleanDat,aes(x=.data[[aerobic_fit]],fill=group))+
+  geom_density(alpha=0.5)+
+  theme_bw()+
+  labs(title="Aerobic Fitness at baseline",
+       x="Value",
+       y="Density")+
+  # scale_fill_manual(values=c("age > 60"="blue","age <= 60"="red"))+
+  theme(legend.title=element_blank())
+
+```
+
+
+We imputed missing data using the covariates, treatment group, and outcome variables. We generated 5 imputed datasets. Most analyses were carried out separately for each dataset to account for uncertainties introduced by imputation. 
+
+# Result
+
+
+## Average Treatment Effect (ATE) 
+
+The primary outcome of interest has been chosen as a memory as it showed the largest average treatment effect. 
+
+
+We assessed convergence of BCF model using Gelman-Rubin's convergence diagnostic and the time-series standard error for the square root of the residual variance parameter, $\sigma$, since this parameter often mixes slowly in tree-based MCMC [@hahn2020bayesian]. For $\sigma$, the Gelman-Rubin statistic was slighly above 1.01 in each imputed dataset, which suggests some remaining autocorrelation or lack of perfect missing. However, this does not by itself mean the MCMC run is unusable. 
+
+To gauge the practical size of Monte Carlo error, we compared the time-series standard error to the posterior standard deviation of $\sigma$. Across all five imputed datasets, the time-series standard error was about 2% of the posterior SD, indicating that Monte Carlo error is small relative to the posterior uncertainty. In other words, the posterior spread in $\sigma$ reflects genuine uncertainty from the data and model, not primarily simulation error from an insufficient MCMC run.  
+
+The slightly elevated Gelman–Rubin values therefore indicate that additional sampling could improve mixing, but the current draws already appear precise enough for summarizing $\sigma$. We would still check that the primary causal estimands, such as the ATE and subgroup ATEs, also have acceptable ESS and Gelman–Rubin diagnostics.
+
+The posterior median and 95% credible intervals of the parameters are shown in @tbl-memory-ATE:
+
+
+```{r}
+#| label: tbl-memory-ATE
+#| echo: false
+#| eval: true
+#| message: false
+#| tbl-cap: "Posterior median and 95% highest probability density credible intervals. The posterior samples from all 5 imputed datasets are pooled to generate the posterior median and 95% credible intervals."
+
+#Read in the bcf file
+bcf1<-readRDS("../memory/bcf_memory_v2.rds")
+
+
+#generate posterior median and 95% credible intervals by pooling all samples across the 5 imputed datasets.
+
+post_pars<-lapply(bcf1,function(x){
+  mcmc_list <- as.mcmc.list(x$coda_chains)
+  
+  # convert to matrix (rows = all iterations stacked, cols = parameter names)
+  mat_all <- as.matrix(mcmc_list)
+  colnames(mat_all)[1:4]   # inspect names; they should include "mu_bar", "tau_bar", "yhat_bar", "sigma" etc
+  
+  # pick one observation (if mu/tau/yhat are per-observation, else they might be aggregated)
+  # For the typical bcf printout each row corresponded to global summaries or averages; if your object stores per-unit variables names differ.
+  # Example: if columns are "mu_bar", "tau_bar", "yhat_bar", "sigma" then:
+  
+  mu_samples   <- mat_all[, "mu_bar"]    # vector of length (iter * chains)
+  tau_samples  <- mat_all[, "tau_bar"]
+  yhat_samples <- mat_all[, "yhat_bar"]
+  sigma_samples<- mat_all[, "sigma"]
+  
+  return(list(
+    mu_bar = mu_samples,
+    tau_bar = tau_samples,
+    yhat_bar = yhat_samples,
+    sigma = sigma_samples
+  ))
+})
+
+par_summary<-
+lapply(c("mu_bar","tau_bar","yhat_bar","sigma"), function(param) {
+  samples <- lapply(post_pars, function(x) x[[param]])
+  combined_samples <- do.call(c, samples)
+  median_val <- median(combined_samples)
+  HPD<-HPDinterval(as.mcmc(combined_samples), prob=0.95)
+  ci_lower <- HPD[1]
+  ci_upper <- HPD[2]
+  
+  val<-sprintf("%.3f (%.3f, %.3f)", median_val, ci_lower, ci_upper)
+  data.table(
+    variable=param,
+    `Median (95% CI)`=val
+  )
+})
+par_summary<-rbindlist(par_summary)
+par_summary[variable=="mu_bar", variable:="$\\bar{\\mu}$"]
+par_summary[variable=="tau_bar", variable:="$\\bar{\\tau}$"]
+par_summary[variable=="yhat_bar", variable:="$\\hat{y}$"]
+par_summary[variable=="sigma", variable:="$\\sigma$"]
+
+#Append posterior probability of ATE>0
+lapply(post_pars, function(x) mean(x$tau_bar > 0)) %>% unlist() %>% mean() -> prob_ate_gt_0
+par_summary<-rbindlist(
+  list(
+    par_summary,
+    data.table(variable="Posterior probability of ATE > 0", `Median (95% CI)`=sprintf("%.3f", prob_ate_gt_0)
+  )
+  ))
+
+par_summary_df<-data.frame(par_summary[,.(`Median (95% CI)`)], check.names = F)
+rownames(par_summary_df)<-par_summary$variable
+
+kable(par_summary_df,
+      row.names = TRUE, #include row names
+      align = "l") # 'r' aligns the row names to the right, 'l' aligns the data to the left
+```
+
+
+The posterior median (95% credible interval) for average treatment effect ($\bar{\tau}) is $ `r par_summary[["Median (95% CI)"]][par_summary$variable=="$\\bar{\\tau}$"]`, which suggest potential positive effect of the treatment on memory. However, the credible interval includes the null value of zero, thus, the evidence of treatment effect is not strong. In addition, the ATE signal is relatively small compared to the residual noise ($\sigma =$ `r par_summary[["Median (95% CI)"]][par_summary$variable=="$\\sigma$"]`), suggesting that the treatment effects are hard to estimate precisely. 
+
+
+## Average Treatment Effect by Age and Gender
+
+
+Age ($\leq 60$ vs. $> 60$) and gender (Male vs. Female) were pre-determined by the PI to be a potential effect modifier. We assessed the treatment effect by age and gender.
+
+```{r}
+#| label: HTE-gender-age
+#| echo: false
+#| eval: true
+#| message: false
+
+source("../function/HTE_summary.R")
+
+#Read in imputed data
+dats<-readRDS("../Data/imp.rds")
+
+
+#Gender 
+imp_dat<-complete(dats,1) #First imputed dataset
+gender_vec<-imp_dat$male  # example covariate for subgrouping
+gender_vec<-as.numeric(gender_vec)-1 #female = 1 ; male=0
+
+
+#Calculate HTE summary for each imputed data and save the results in a list.
+summary_out<-lapply(bcf1,HTE_summary,subgroup_val=gender_vec)
+
+#pull the difference in taus from each imputed dataset to make final conclusion
+tau_diff_by_iter_gender<-lapply(summary_out,function(x)x$tau_diff_by_iter)
+tau_diff_by_iter_gender<-do.call(c,tau_diff_by_iter_gender)
+
+
+
+#age
+age_vec<-imp_dat$Age
+age_group_vec<-ifelse(age_vec<=60,1,0) #age <=60 = 1; age >60 = 0
+
+
+#Calculate HTE summary for each imputed data and save the results in a list.
+summary_out<-lapply(bcf1,HTE_summary,subgroup_val=age_group_vec)
+
+#pull the difference in taus from each imputed dataset to make final conclusion
+tau_diff_by_iter_age<-lapply(summary_out,function(x)x$tau_diff_by_iter)
+tau_diff_by_iter_age<-do.call(c,tau_diff_by_iter_age)
+
+
+```
+
+
+The probability of ATE being higher in female than male was `r sprintf("%.3f",mean(tau_diff_by_iter_gender>0))`, and higher in $\leq 60$ than in $> 60$ was `r sprintf("%.3f",mean(tau_diff_by_iter_age>0))`.  With both probabilities being high, we provide the ATE distributions by each group in @fig-HTE-gender-age.: 
+
+```{r}
+#| label: fig-HTE-gender-age
+#| echo: false
+#| eval: true
+#| message: false
+#| fig-cap: >
+#|   ATE distribution by (a) age group and
+#|   (b) gender. (a) ATE is higher in age $\leq 60$
+#|   than in age $> 60$. (b) ATE is higher in female than male.
+#| fig-subcap:
+#|   - ""
+#|   - ""
+#| layout-ncol: 2
+
+knitr::include_graphics(c("../memory/age_group_density_plot.png", "../memory/gender_group_density_plot.png"))
+
+```
+
+The difference in ATEs for the two comparisons are shown in @tbl-HTE-gender-age:
+
+```{r}
+#| label: tbl-HTE-gender-age
+#| echo: false
+#| eval: true
+#| message: false
+#| tbl-cap: "Posterior mean and 95% highest probability density credible intervals. The posterior samples from all 5 imputed datasets are pooled to generate them."
+
+table2<-readRDS("../memory/table2.rds")
+kable(table2)
+```
+
+
+## Identifying Potential Subgroup
+
+```{r}
+#| label: fig-memory-cart
+#| echo: false
+#| eval: true
+#| message: false
+#| fig-cap: > 
+#|   Recursive Partitioning and Regression Trees (CART) fitted on average treatment effect (ATE) to identify potential subgroups. All baseline covariates were used as predctors. The plot shows the pruned tree after applying the 1-SE rule. The complexity parameter (cp) was $R^2$, which is the proportion of variance explained by the split.
+
+
+include_graphics("../memory/cart.png")
+
+```
+
+
+```{r}
+#| echo: false
+#| eval: true
+#| message: false
+
+#Data dictionary
+mem_vars<-data_dictionary[SUBID %in%c("MeanDia24hrT1","memt1r","clinicdbpt1","adbasT1")]
+
+first<-data_dictionary[SUBID=="MeanDia24hrT1",`Subject identifier`]
+
+memt1r_name<-data_dictionary[SUBID=="memt1r",`Subject identifier`]
+
+clinicdbpt1_name<-data_dictionary[SUBID=="clinicdbpt1",`Subject identifier`]
+
+
+framenoaget1_name<-data_dictionary[SUBID=="framenoaget1",`Subject identifier`]
+
+adbasT1_name<-data_dictionary[SUBID=="adbasT1",`Subject identifier`]
+
+```
+
+The root split was on `r first`. On average, patients with `r first` less than 66 showed negative effect of the treatment, while those with `r first` $\geq 66$ showed positive effect of the treatment. Among observations `r first` $\geq 66$, the next split was on `r memt1r_name`. Among the observations  `r first` $< 66$, the next split was on `r clinicdbpt1_name`. (After pruning using the 1-SE rule, some lower-level splits, such as the split on `r framenoaget1_name`, were removed, indicating that those subtrees did not improve cross-validated prediction enough to justify their additional complexity.). Please note that `adbasT1` refers to `r adbasT1_name`.
+
+
+## Results for Processing Speed and Executive Function
+
+
+```{r}
+#| label: tbl-processing-exec-ATE
+#| echo: false
+#| eval: true
+#| message: false
+#| tbl-cap: "Posterior median and 95% highest probability density credible intervals. The posterior samples from all 5 imputed datasets are pooled to generate the summary statistics."
+
+#Read in the bcf file
+bcf_processing<-readRDS("../processing_speed/bcf_processing_speed_v4.rds")
+bcf_exec<-readRDS("../executive_function/bcf_executive_function_v4.rds")
+
+
+#generate posterior median and 95% credible intervals by pooling all samples across the 5 imputed datasets.
+
+processing_post_pars<-lapply(bcf_processing,function(x){
+  mcmc_list <- as.mcmc.list(x$coda_chains)
+  
+  # convert to matrix (rows = all iterations stacked, cols = parameter names)
+  mat_all <- as.matrix(mcmc_list)
+  colnames(mat_all)[1:4]   # inspect names; they should include "mu_bar", "tau_bar", "yhat_bar", "sigma" etc
+  
+  # pick one observation (if mu/tau/yhat are per-observation, else they might be aggregated)
+  # For the typical bcf printout each row corresponded to global summaries or averages; if your object stores per-unit variables names differ.
+  # Example: if columns are "mu_bar", "tau_bar", "yhat_bar", "sigma" then:
+  
+  mu_samples   <- mat_all[, "mu_bar"]    # vector of length (iter * chains)
+  tau_samples  <- mat_all[, "tau_bar"]
+  yhat_samples <- mat_all[, "yhat_bar"]
+  sigma_samples<- mat_all[, "sigma"]
+  
+  return(list(
+    mu_bar = mu_samples,
+    tau_bar = tau_samples,
+    yhat_bar = yhat_samples,
+    sigma = sigma_samples
+  ))
+})
+
+
+exec_post_pars<-lapply(bcf_exec,function(x){
+  mcmc_list <- as.mcmc.list(x$coda_chains)
+  
+  # convert to matrix (rows = all iterations stacked, cols = parameter names)
+  mat_all <- as.matrix(mcmc_list)
+  colnames(mat_all)[1:4]   # inspect names; they should include "mu_bar", "tau_bar", "yhat_bar", "sigma" etc
+  
+  # pick one observation (if mu/tau/yhat are per-observation, else they might be aggregated)
+  # For the typical bcf printout each row corresponded to global summaries or averages; if your object stores per-unit variables names differ.
+  # Example: if columns are "mu_bar", "tau_bar", "yhat_bar", "sigma" then:
+  
+  mu_samples   <- mat_all[, "mu_bar"]    # vector of length (iter * chains)
+  tau_samples  <- mat_all[, "tau_bar"]
+  yhat_samples <- mat_all[, "yhat_bar"]
+  sigma_samples<- mat_all[, "sigma"]
+  
+  return(list(
+    mu_bar = mu_samples,
+    tau_bar = tau_samples,
+    yhat_bar = yhat_samples,
+    sigma = sigma_samples
+  ))
+})
+
+
+processing_par_summary<-
+lapply(c("mu_bar","tau_bar","yhat_bar","sigma"), function(param) {
+  samples <- lapply(processing_post_pars, function(x) x[[param]])
+  combined_samples <- do.call(c, samples)
+  median_val <- median(combined_samples)
+  HPD<-HPDinterval(as.mcmc(combined_samples), prob=0.95)
+  ci_lower <- HPD[1]
+  ci_upper <- HPD[2]
+  
+  val<-sprintf("%.3f (%.3f, %.3f)", median_val, ci_lower, ci_upper)
+  data.table(
+    variable=param,
+    `Median (95% CI)`=val
+  )
+})
+processing_par_summary<-rbindlist(processing_par_summary)
+processing_par_summary[variable=="mu_bar", variable:="$\\bar{\\mu}$"]
+processing_par_summary[variable=="tau_bar", variable:="$\\bar{\\tau}$"]
+processing_par_summary[variable=="yhat_bar", variable:="$\\hat{y}$"]
+processing_par_summary[variable=="sigma", variable:="$\\sigma$"]
+
+exec_par_summary<-
+lapply(c("mu_bar","tau_bar","yhat_bar","sigma"), function(param) {
+  samples <- lapply(exec_post_pars, function(x) x[[param]])
+  combined_samples <- do.call(c, samples)
+  median_val <- median(combined_samples)
+  HPD<-HPDinterval(as.mcmc(combined_samples), prob=0.95)
+  ci_lower <- HPD[1]
+  ci_upper <- HPD[2]
+  
+  val<-sprintf("%.3f (%.3f, %.3f)", median_val, ci_lower, ci_upper)
+  data.table(
+    variable=param,
+    `Median (95% CI)`=val
+  )
+})
+
+exec_par_summary<-rbindlist(exec_par_summary)
+
+exec_par_summary[variable=="mu_bar", variable:="$\\bar{\\mu}$"]
+exec_par_summary[variable=="tau_bar", variable:="$\\bar{\\tau}$"]
+exec_par_summary[variable=="yhat_bar", variable:="$\\hat{y}$"]
+exec_par_summary[variable=="sigma", variable:="$\\sigma$"]
+
+#Append posterior probability of ATE>0
+process_prob_ate_gt_0<-lapply(processing_post_pars, function(x) mean(x$tau_bar > 0)) %>% unlist() %>% mean() 
+
+exec_prob_ate_gt_0<-lapply(exec_post_pars, function(x) mean(x$tau_bar > 0)) %>% unlist() %>% mean()  
+
+processing_par_summary<-rbindlist(
+  list(
+    processing_par_summary,
+    data.table(variable="Posterior probability of ATE > 0", `Median (95% CI)`=sprintf("%.3f", process_prob_ate_gt_0)
+  )
+  ))
+
+processing_par_summary_df<-data.frame(processing_par_summary[,.(`Median (95% CI)`)], check.names = F)
+rownames(processing_par_summary_df)<-processing_par_summary$variable
+
+exec_par_summary<-rbindlist(
+  list(
+    exec_par_summary,
+    data.table(variable="Posterior probability of ATE > 0", `Median (95% CI)`=sprintf("%.3f", exec_prob_ate_gt_0)
+  )
+  ))
+
+
+exec_par_summary_df<-data.frame(exec_par_summary[,.(`Median (95% CI)`)], check.names = F)
+rownames(exec_par_summary_df)<-exec_par_summary$variable
+
+
+# Combine the datasets into a new data frame
+combined_df <- data.frame(
+  " " = rownames(processing_par_summary_df), # Or use processing_par_summary_df$variable if they aren't row names
+  "Processing Speed" = processing_par_summary_df[["Median (95% CI)"]],
+  "Executive Function" = exec_par_summary_df[["Median (95% CI)"]],
+  check.names = FALSE
+)
+
+# 2. Render with kable
+# "r" for the right-aligned labels, "c" to center the two data columns
+kable(combined_df, 
+      row.names = FALSE, 
+      align = "rcc", 
+      escape = FALSE)
+
+```
+
+
+
+
+```{r}
+#| label: tbl-HTE-processing-executive
+#| echo: false
+#| eval: true
+#| message: false
+#| tbl-cap: "Posterior mean and 95% highest probability density credible intervals. The posterior samples from all 5 imputed datasets are pooled to generate the summary statistics."
+
+table2_process<-readRDS("../processing_speed/table2.rds")
+table2_exe<-readRDS("../executive_function/table2.rds")
+
+setnames(table2_process,"difference in ATE","process")
+setnames(table2_exe,"difference in ATE","exe")
+
+table2_combined <- merge(
+  table2_exe,
+  table2_process,
+  by = c("subgroup1", "subgroup2"),
+  all = TRUE
+)
+
+
+table2_combined[
+  ,
+  comparison := paste0(subgroup1, " vs. ", subgroup2)
+]
+
+
+library(gt)
+
+table2_combined_gt <- table2_combined[
+  ,
+  .(
+    comparison,
+    exe,
+    process
+  )
+] |>
+  gt(rowname_col = "comparison") |>
+  tab_stubhead(label = "Subgroup comparison") |>
+  cols_label(
+    exe = "Execution",
+    process = "Processing Speed"
+  ) |>
+  tab_header(
+    title = "Difference in ATE by subgroup comparison"
+  )
+
+table2_combined_gt
+```
+
+
+
+
+```{r}
+#| label: fig-exe-process-CART
+#| echo: false
+#| eval: true
+#| message: false
+#| fig-cap: >
+#|   Pruned CART for the disease outcome (a) executive function and
+#|   (b) processing spped. 
+#| fig-subcap:
+#|   - ""
+#|   - ""
+#| layout-ncol: 2
+
+knitr::include_graphics(c("../executive_function/cart.png", "../processing_speed/cart.png"))
+
+```
